@@ -12,7 +12,7 @@ import tempfile
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # or ["https://yourusername.github.io"] for more security
+    allow_origins=["https://martinidiomainternacional.github.io"],  # or ["https://yourusername.github.io"] for more security
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
