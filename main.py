@@ -1,4 +1,4 @@
-
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import JSONResponse
 import librosa
@@ -10,6 +10,13 @@ import uvicorn
 import tempfile
 
 app = FastAPI()
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or ["https://yourusername.github.io"] for more security
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 wav2vec_model = WAV2VEC2_BASE.get_model()
 hubert_model = HUBERT_BASE.get_model()
