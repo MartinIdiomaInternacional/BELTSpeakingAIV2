@@ -70,31 +70,39 @@ def estimate_level_embedding(embedding):
     energy = np.linalg.norm(embedding)
     return classify_cefr_level(energy, [85, 100, 115, 130, 145])
 
+import traceback
+
 @app.post("/evaluate")
 async def evaluate_audio(file: UploadFile = File(...)):
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-        tmp.write(await file.read())
-        tmp_path = tmp.name
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+            tmp.write(await file.read())
+            tmp_path = tmp.name
 
-    y, sr = librosa.load(tmp_path)
-    waveform, sr_torch = torchaudio.load(tmp_path)
+        y, sr = librosa.load(tmp_path)
+        waveform, sr_torch = torchaudio.load(tmp_path)
 
-    basic_features = extract_basic_features(y, sr)
-    level_basic = estimate_level_basic(basic_features)
+        basic_features = extract_basic_features(y, sr)
+        level_basic = estimate_level_basic(basic_features)
 
-    emb_w2v = extract_deep_features(waveform, sr_torch, wav2vec_model)
-    level_w2v = estimate_level_embedding(emb_w2v)
+        emb_w2v = extract_deep_features(waveform, sr_torch, wav2vec_model)
+        level_w2v = estimate_level_embedding(emb_w2v)
 
-    emb_hubert = extract_deep_features(waveform, sr_torch, hubert_model)
-    level_hubert = estimate_level_embedding(emb_hubert)
+        emb_hubert = extract_deep_features(waveform, sr_torch, hubert_model)
+        level_hubert = estimate_level_embedding(emb_hubert)
 
-    result = {
-        "basic": {"level": level_basic, "explanation": get_explanation(level_basic)},
-        "wav2vec2": {"level": level_w2v, "explanation": get_explanation(level_w2v)},
-        "hubert": {"level": level_hubert, "explanation": get_explanation(level_hubert)},
-    }
+        result = {
+            "basic": {"level": level_basic, "explanation": get_explanation(level_basic)},
+            "wav2vec2": {"level": level_w2v, "explanation": get_explanation(level_w2v)},
+            "hubert": {"level": level_hubert, "explanation": get_explanation(level_hubert)},
+        }
 
-    return JSONResponse(content=result)
+        return JSONResponse(content=result)
+
+    except Exception as e:
+        traceback.print_exc()
+        return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
