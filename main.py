@@ -79,8 +79,16 @@ async def evaluate_audio(file: UploadFile = File(...)):
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        y, sr = librosa.load(tmp_path)
-        waveform, sr_torch = torchaudio.load(tmp_path)
+        # Try to load with librosa (always works)
+        y, sr = librosa.load(tmp_path, sr=16000)
+
+        # Try torchaudio.load(), fallback to librosa if needed
+        try:
+            waveform, sr_torch = torchaudio.load(tmp_path)
+        except Exception:
+            # Fallback: convert librosa output to torch tensor
+            waveform = torch.tensor(y).unsqueeze(0)  # shape [1, n_samples]
+            sr_torch = sr
 
         basic_features = extract_basic_features(y, sr)
         level_basic = estimate_level_basic(basic_features)
@@ -102,6 +110,7 @@ async def evaluate_audio(file: UploadFile = File(...)):
     except Exception as e:
         traceback.print_exc()
         return JSONResponse(status_code=500, content={"error": str(e)})
+
 
 
 if __name__ == "__main__":
