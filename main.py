@@ -14,8 +14,8 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://martinidiomainternacional.github.io"],  # or ["https://yourusername.github.io"] for more security
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["https://martinidiomainternacional.github.io"],
+    allow_headers=["https://martinidiomainternacional.github.io"],
 )
 
 wav2vec_model = WAV2VEC2_BASE.get_model()
