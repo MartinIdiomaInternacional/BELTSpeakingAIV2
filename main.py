@@ -59,12 +59,11 @@ def estimate_level_basic(features):
     avg_score = (tempo + mfcc_std * 10) / 2
     return classify_cefr_level(avg_score, [70, 85, 100, 115, 130])
 
-def extract_deep_features(waveform, sr, model):
-    if sr != 16000:
-        waveform = torchaudio.functional.resample(waveform, sr, 16000)
-    with torch.inference_mode():
-        features = model(waveform).extractor_features
-    return features.mean(dim=1).squeeze().numpy()
+outputs = model(waveform)
+if isinstance(outputs, tuple):
+    features = outputs[1]
+else:
+    features = outputs.extractor_features
 
 def estimate_level_embedding(embedding):
     energy = np.linalg.norm(embedding)
