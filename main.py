@@ -11,7 +11,6 @@ import tempfile
 import traceback
 
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://martinidiomainternacional.github.io"],
@@ -20,11 +19,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Load models
 wav2vec_model = WAV2VEC2_BASE.get_model()
 hubert_model = HUBERT_BASE.get_model()
 
-# CEFR classification logic
 def classify_cefr_level(value, thresholds):
     if value < thresholds[0]:
         return "A1"
@@ -67,13 +64,22 @@ def extract_deep_features(waveform, sr, model):
     if sr != 16000:
         waveform = torchaudio.functional.resample(waveform, sr, 16000)
     with torch.inference_mode():
-        outputs = model(waveform)
-        if isinstance(outputs, tuple):
-            features = outputs[1]
-            if features is None:
-                raise ValueError("Model did not return extractor features.")
+        output = model(waveform)
+
+        if isinstance(output, tuple):
+            features = output[1] if len(output) > 1 else None
+        elif hasattr(output, 'extractor_features'):
+            features = output.extractor_features
+        elif hasattr(output, 'hidden_states'):
+            features = output.hidden_states[-1]
+        elif hasattr(output, 'last_hidden_state'):
+            features = output.last_hidden_state
         else:
-            features = outputs.extractor_features
+            features = None
+
+        if features is None:
+            raise ValueError("Model did not return usable extractor features.")
+
     return features.mean(dim=1).squeeze().numpy()
 
 def estimate_level_embedding(embedding):
@@ -87,17 +93,14 @@ async def evaluate_audio(file: UploadFile = File(...)):
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # Load with librosa (always resampled to 16kHz)
         y, sr = librosa.load(tmp_path, sr=16000)
 
-        # Try torchaudio load first
         try:
             waveform, sr_torch = torchaudio.load(tmp_path)
         except Exception:
             waveform = torch.tensor(y).unsqueeze(0)
             sr_torch = sr
 
-        # Extract features and estimate levels
         basic_features = extract_basic_features(y, sr)
         level_basic = estimate_level_basic(basic_features)
 
