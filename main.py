@@ -66,16 +66,22 @@ def extract_deep_features(waveform, sr, model):
     with torch.inference_mode():
         output = model(waveform)
 
+        # Print type info for debugging
+        print("Model output type:", type(output))
+        print("Output attributes:", dir(output))
+
+        features = None
         if isinstance(output, tuple):
-            features = output[1] if len(output) > 1 else None
+            if len(output) > 1:
+                features = output[1]
+            elif hasattr(output[0], 'extractor_features'):
+                features = output[0].extractor_features
         elif hasattr(output, 'extractor_features'):
             features = output.extractor_features
         elif hasattr(output, 'hidden_states'):
             features = output.hidden_states[-1]
         elif hasattr(output, 'last_hidden_state'):
             features = output.last_hidden_state
-        else:
-            features = None
 
         if features is None:
             raise ValueError("Model did not return usable extractor features.")
