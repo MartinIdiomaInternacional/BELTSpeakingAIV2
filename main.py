@@ -11,6 +11,7 @@ import tempfile
 import traceback
 
 app = FastAPI()
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://martinidiomainternacional.github.io"],
@@ -19,6 +20,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Load models
 wav2vec_model = WAV2VEC2_BASE.get_model()
 hubert_model = HUBERT_BASE.get_model()
 
@@ -63,19 +65,17 @@ def estimate_level_basic(features):
 def extract_deep_features(waveform, sr, model):
     if sr != 16000:
         waveform = torchaudio.functional.resample(waveform, sr, 16000)
+
     with torch.inference_mode():
         output = model(waveform)
-
-        # Print type info for debugging
-        print("Model output type:", type(output))
-        print("Output attributes:", dir(output))
-
         features = None
+
         if isinstance(output, tuple):
-            if len(output) > 1:
-                features = output[1]
-            elif hasattr(output[0], 'extractor_features'):
-                features = output[0].extractor_features
+            for i, item in enumerate(output):
+                if isinstance(item, torch.Tensor):
+                    features = item
+                    print(f"✅ Selected output[{i}] as feature tensor")
+                    break
         elif hasattr(output, 'extractor_features'):
             features = output.extractor_features
         elif hasattr(output, 'hidden_states'):
@@ -84,6 +84,8 @@ def extract_deep_features(waveform, sr, model):
             features = output.last_hidden_state
 
         if features is None:
+            print("🛑 Model output type:", type(output))
+            print("🛠️ Output attributes:", dir(output))
             raise ValueError("Model did not return usable extractor features.")
 
     return features.mean(dim=1).squeeze().numpy()
@@ -99,8 +101,10 @@ async def evaluate_audio(file: UploadFile = File(...)):
             tmp.write(await file.read())
             tmp_path = tmp.name
 
+        # Load with librosa for basic features
         y, sr = librosa.load(tmp_path, sr=16000)
 
+        # Load with torchaudio or fallback
         try:
             waveform, sr_torch = torchaudio.load(tmp_path)
         except Exception:
