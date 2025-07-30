@@ -210,3 +210,6 @@ async def final_result(session_id: str = Form(...)):
     
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.get("/")
+async def root():
+    return {"message": "CEFR Speaking Evaluator API is running"}
