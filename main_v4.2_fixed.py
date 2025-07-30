@@ -15,14 +15,16 @@ import uuid
 from gtts import gTTS
 from openai import OpenAI
 
-# Initialize OpenAI client
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# ==============================
+# Initialize OpenAI Client
+# ==============================
+client = OpenAI()  # Automatically reads OPENAI_API_KEY from Render environment
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # adjust to your GitHub domain if needed
+    allow_origins=["*"],  # you can restrict this to your GitHub Pages domain
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -44,9 +46,7 @@ questions = {
     "C2": ["If you were leading an international organization, how would you solve a global crisis?", "Is democracy the best form of government for all countries?", "What are the long-term consequences of technological dependence on society?"]
 }
 
-# ==============================
-# Session Storage
-# ==============================
+# Session storage
 sessions = {}
 
 # ==============================
@@ -119,15 +119,15 @@ def generate_tts(text, filename):
         tts.save(filename)
     except Exception as e:
         print("TTS error:", e)
+        return None
     return filename
 
 # ==============================
 # API Endpoints
 # ==============================
-
 @app.get("/")
 async def root():
-    return {"message": "CEFR Speaking Evaluator API v4.2 (patched) is running"}
+    return {"message": "CEFR Speaking Evaluator API v4.3 is running"}
 
 @app.post("/start_test")
 async def start_test():
@@ -194,5 +194,6 @@ async def final_result(session_id: str = Form(...)):
 async def get_audio(filename: str):
     return FileResponse(filename, media_type="audio/mpeg")
 
+# Run on Render's detected port
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
