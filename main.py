@@ -9,26 +9,26 @@ from torchaudio.pipelines import WAV2VEC2_BASE, HUBERT_BASE
 import uvicorn
 import tempfile
 import traceback
-import openai
 import os
 import random
 import uuid
 from gtts import gTTS
+from openai import OpenAI
 
-# Set OpenAI key
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Initialize OpenAI client
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # change to your GitHub pages domain if needed
+    allow_origins=["*"],  # adjust to your GitHub domain if needed
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load models
+# Load speech models
 wav2vec_model = WAV2VEC2_BASE.get_model()
 hubert_model = HUBERT_BASE.get_model()
 
@@ -89,6 +89,7 @@ questions = {
            "How might virtual reality change human interaction in the next 50 years?", "Should history be rewritten to correct past biases?",
            "Do international laws need to change to handle cyber warfare?", "Discuss the ethical dilemmas of cloning humans.",
            "Should space colonization be humanity's top priority?", "To what extent can art influence global political change?"]
+
 }
 
 # ==============================
@@ -125,12 +126,16 @@ def extract_deep_features(waveform, sr, model):
     return np.array([0.0])
 
 def transcribe_audio(file_path):
-    with open(file_path, "rb") as audio_file:
-        transcript = openai.Audio.transcriptions.create(
-            model="whisper-1",
-            file=audio_file
-        )
-    return transcript.text
+    try:
+        with open(file_path, "rb") as audio_file:
+            transcript = client.audio.transcriptions.create(
+                model="whisper-1",
+                file=audio_file
+            )
+        return transcript.text or ""
+    except Exception as e:
+        print("Transcription error:", e)
+        return ""
 
 def analyze_text(transcript):
     prompt = f"""
@@ -146,15 +151,22 @@ def analyze_text(transcript):
       "coherence": {{"level":"B1","explanation":"..."}}
     }}
     """
-    response = openai.ChatCompletion.create(
-        model="gpt-4o",
-        messages=[{"role": "user", "content": prompt}]
-    )
-    return response.choices[0].message["content"]
+    try:
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[{"role": "user", "content": prompt}]
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        print("Analysis error:", e)
+        return '{"grammar": {"level":"A1","explanation":"Minimal analysis."}}'
 
 def generate_tts(text, filename):
-    tts = gTTS(text)
-    tts.save(filename)
+    try:
+        tts = gTTS(text)
+        tts.save(filename)
+    except Exception as e:
+        print("TTS error:", e)
     return filename
 
 # ==============================
@@ -163,7 +175,7 @@ def generate_tts(text, filename):
 
 @app.get("/")
 async def root():
-    return {"message": "CEFR Speaking Evaluator API v4.2 is running"}
+    return {"message": "CEFR Speaking Evaluator API v4.2 (patched) is running"}
 
 @app.post("/start_test")
 async def start_test():
@@ -190,6 +202,7 @@ async def next_question(session_id: str = Form(...), file: UploadFile = File(...
         pron_level = estimate_level_embedding(emb)
         transcript = transcribe_audio(tmp_path)
         text_eval = analyze_text(transcript)
+
         sessions[session_id]["answers"].append({"pronunciation": pron_level, "text": text_eval})
         sessions[session_id]["questions_asked"] += 1
 
@@ -204,7 +217,7 @@ async def next_question(session_id: str = Form(...), file: UploadFile = File(...
         if sessions[session_id]["questions_asked"] >= 6:
             return JSONResponse({"done": True})
 
-        next_q = random.choice(questions.get(next_level, questions["A1"]))
+        next_q = random.choice(questions.get(next_level, questions["A1"])) or "Please answer this next question."
         audio_file = f"{session_id}_q{sessions[session_id]['questions_asked']+1}.mp3"
         generate_tts(next_q, audio_file)
         return JSONResponse({"done": False, "question": next_q, "audio_url": f"/audio/{audio_file}"})
@@ -219,7 +232,7 @@ async def final_result(session_id: str = Form(...)):
         return JSONResponse(status_code=404, content={"error": "Session not found."})
     answers = sessions[session_id]["answers"]
     levels = [ans["pronunciation"] for ans in answers]
-    final_level = max(set(levels), key=levels.count)
+    final_level = max(set(levels), key=levels.count) if levels else "A1"
     feedback_text = f"Your estimated CEFR level is {final_level}. Keep practicing grammar and vocabulary to improve further."
     feedback_audio = f"{session_id}_final.mp3"
     generate_tts(feedback_text, feedback_audio)
