@@ -1,9 +1,8 @@
-
 fastapi
 uvicorn
 librosa
-numpy==1.23.5
+numpy
 torch
 torchaudio
-soundfile
+openai
 python-multipart
