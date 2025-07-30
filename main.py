@@ -9,9 +9,15 @@ from torchaudio.pipelines import WAV2VEC2_BASE, HUBERT_BASE
 import uvicorn
 import tempfile
 import traceback
+import openai
+import os
+
+# Load OpenAI API Key
+openai.api_key = os.getenv("OPENAI_API_KEY")
 
 app = FastAPI()
 
+# Allow frontend access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["https://martinidiomainternacional.github.io"],
@@ -23,6 +29,10 @@ app.add_middleware(
 # Load models
 wav2vec_model = WAV2VEC2_BASE.get_model()
 hubert_model = HUBERT_BASE.get_model()
+
+# =========================
+# Utility Functions
+# =========================
 
 def classify_cefr_level(value, thresholds):
     if value < thresholds[0]:
@@ -38,15 +48,16 @@ def classify_cefr_level(value, thresholds):
     else:
         return "C2"
 
-def get_explanation(level):
-    return {
-        "A1": "Very limited fluency, slow and hesitant delivery.",
-        "A2": "Basic fluency with frequent pauses and low variation.",
-        "B1": "Fair fluency with simple rhythm and moderate control.",
-        "B2": "Good fluency and control; some complexity observed.",
-        "C1": "Fluent and confident speech with nuanced intonation.",
-        "C2": "Highly fluent, articulate, and natural sounding delivery."
-    }[level]
+def get_pronunciation_explanation(level):
+    explanations = {
+        "A1": "Your speech is hesitant and unclear, making understanding difficult.",
+        "A2": "Pronunciation is understandable but with frequent pauses and mispronounced sounds.",
+        "B1": "Speech is generally clear but still influenced by your first language.",
+        "B2": "You speak with good pronunciation and intonation, with occasional mistakes.",
+        "C1": "You sound natural and fluent, with minor pronunciation issues.",
+        "C2": "Your pronunciation is near-native, clear, and natural throughout."
+    }
+    return explanations[level]
 
 def extract_basic_features(y, sr):
     mfcc = librosa.feature.mfcc(y=y, sr=sr, n_mfcc=13)
@@ -65,16 +76,13 @@ def estimate_level_basic(features):
 def extract_deep_features(waveform, sr, model):
     if sr != 16000:
         waveform = torchaudio.functional.resample(waveform, sr, 16000)
-
     with torch.inference_mode():
         output = model(waveform)
         features = None
-
         if isinstance(output, tuple):
-            for i, item in enumerate(output):
+            for item in output:
                 if isinstance(item, torch.Tensor):
                     features = item
-                    print(f"✅ Selected output[{i}] as feature tensor")
                     break
         elif hasattr(output, 'extractor_features'):
             features = output.extractor_features
@@ -84,8 +92,6 @@ def extract_deep_features(waveform, sr, model):
             features = output.last_hidden_state
 
         if features is None:
-            print("🛑 Model output type:", type(output))
-            print("🛠️ Output attributes:", dir(output))
             raise ValueError("Model did not return usable extractor features.")
 
     return features.mean(dim=1).squeeze().numpy()
@@ -94,6 +100,46 @@ def estimate_level_embedding(embedding):
     energy = np.linalg.norm(embedding)
     return classify_cefr_level(energy, [85, 100, 115, 130, 145])
 
+# =========================
+# Whisper Transcription
+# =========================
+def transcribe_audio(file_path):
+    with open(file_path, "rb") as audio_file:
+        transcript = openai.Audio.transcriptions.create(
+            model="whisper-1",
+            file=audio_file
+        )
+    return transcript.text
+
+# =========================
+# Grammar & Vocabulary Analysis
+# =========================
+def analyze_grammar_vocabulary(transcript):
+    prompt = f"""
+    You are a certified English CEFR evaluator. Analyze this transcript and evaluate:
+    1. Grammar CEFR level (A1-C2)
+    2. Vocabulary CEFR level (A1-C2)
+    3. Mistakes made in grammar and vocabulary
+    4. Personalized feedback on how to improve based on CEFR descriptors
+
+    Transcript:
+    \"\"\"{transcript}\"\"\"
+
+    Provide output in JSON:
+    {{
+        "grammar": {{"level": "B1", "explanation": "..." }},
+        "vocabulary": {{"level": "B2", "explanation": "..." }}
+    }}
+    """
+    response = openai.ChatCompletion.create(
+        model="gpt-4o",
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return response.choices[0].message["content"]
+
+# =========================
+# API Endpoint
+# =========================
 @app.post("/evaluate")
 async def evaluate_audio(file: UploadFile = File(...)):
     try:
@@ -101,29 +147,35 @@ async def evaluate_audio(file: UploadFile = File(...)):
             tmp.write(await file.read())
             tmp_path = tmp.name
 
-        # Load with librosa for basic features
+        # Load audio
         y, sr = librosa.load(tmp_path, sr=16000)
-
-        # Load with torchaudio or fallback
         try:
             waveform, sr_torch = torchaudio.load(tmp_path)
         except Exception:
             waveform = torch.tensor(y).unsqueeze(0)
             sr_torch = sr
 
+        # 1️⃣ Pronunciation evaluation
         basic_features = extract_basic_features(y, sr)
         level_basic = estimate_level_basic(basic_features)
-
         emb_w2v = extract_deep_features(waveform, sr_torch, wav2vec_model)
         level_w2v = estimate_level_embedding(emb_w2v)
-
         emb_hubert = extract_deep_features(waveform, sr_torch, hubert_model)
         level_hubert = estimate_level_embedding(emb_hubert)
 
+        # Final pronunciation level (majority vote)
+        pronunciation_levels = [level_basic, level_w2v, level_hubert]
+        final_pron_level = max(set(pronunciation_levels), key=pronunciation_levels.count)
+
+        # 2️⃣ Grammar & Vocabulary evaluation
+        transcript = transcribe_audio(tmp_path)
+        gpt_analysis = analyze_grammar_vocabulary(transcript)
+
+        # Combine results
         result = {
-            "basic": {"level": level_basic, "explanation": get_explanation(level_basic)},
-            "wav2vec2": {"level": level_w2v, "explanation": get_explanation(level_w2v)},
-            "hubert": {"level": level_hubert, "explanation": get_explanation(level_hubert)},
+            "pronunciation": {"level": final_pron_level, "explanation": get_pronunciation_explanation(final_pron_level)},
+            "text_analysis": gpt_analysis,
+            "transcript": transcript
         }
 
         return JSONResponse(content=result)
