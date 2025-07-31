@@ -142,7 +142,7 @@ async def next_question(session_id: str = Form(...), file: UploadFile = File(...
         return JSONResponse({"done": False, "question": next_q, "audio_url": f"/audio/{audio_file}"})
     except Exception as e:
         traceback.print_exc()
-        return JSONResponse(status_code=500, content={"error": str(e)}})
+        return JSONResponse(status_code=500, content={"error": str(e)})
 
 @app.post("/final_result")
 async def final_result(session_id: str = Form(...)):
