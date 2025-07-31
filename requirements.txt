@@ -7,7 +7,7 @@ torch==2.7.1
 numpy==1.23.5
 scikit-learn==1.7.0
 gTTS==2.5.3
-openai==1.35.14
+openai==1.13.3
 python-multipart==0.0.9
 requests==2.32.3
 typing-extensions>=4.8.0
