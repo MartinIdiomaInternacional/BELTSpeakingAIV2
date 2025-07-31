@@ -18,25 +18,24 @@ from openai import OpenAI
 # ==============================
 # Initialize OpenAI Client
 # ==============================
-client = OpenAI()  # Automatically reads OPENAI_API_KEY from Render environment
+OPENAI_KEY = os.getenv("OPENAI_API_KEY")
+client = OpenAI(api_key=OPENAI_KEY)
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict this to your GitHub Pages domain
+    allow_origins=["*"],  # replace "*" with your GitHub Pages domain for security
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Load speech models
+# Load models
 wav2vec_model = WAV2VEC2_BASE.get_model()
 hubert_model = HUBERT_BASE.get_model()
 
-# ==============================
-# Question bank per CEFR level
-# ==============================
+# Question bank
 questions = {
     "A1": ["What is your name and where are you from?", "Describe your family.", "What do you usually eat for breakfast?"],
     "A2": ["Can you describe your last holiday?", "What do you usually do when you meet new people?", "Tell me about your favorite TV program."],
@@ -49,9 +48,7 @@ questions = {
 # Session storage
 sessions = {}
 
-# ==============================
 # Helper functions
-# ==============================
 def classify_cefr_level(value, thresholds):
     if value < thresholds[0]: return "A1"
     elif value < thresholds[1]: return "A2"
@@ -122,9 +119,7 @@ def generate_tts(text, filename):
         return None
     return filename
 
-# ==============================
-# API Endpoints
-# ==============================
+# API endpoints
 @app.get("/")
 async def root():
     return {"message": "CEFR Speaking Evaluator API v4.3 is running"}
@@ -194,6 +189,6 @@ async def final_result(session_id: str = Form(...)):
 async def get_audio(filename: str):
     return FileResponse(filename, media_type="audio/mpeg")
 
-# Run on Render's detected port
+# Run app
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
