@@ -1,11 +1,11 @@
-# Base Python image
+# Dockerfile for CEFR Speaking Evaluator API
 FROM python:3.10-slim
 
-# Prevents Python from writing .pyc files and buffering stdout
+# Environment settings
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# Set working directory
+# Create app directory
 WORKDIR /app
 
 # Install system dependencies
@@ -18,17 +18,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements and install Python packages
+# Copy requirements file
 COPY requirements.txt .
+
+# Install Python dependencies
 RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
-COPY main.py ./main.py
+COPY main.py .
 
-# Expose the app port (Render automatically detects this)
+# Expose port
 EXPOSE 10000
 
-# Run the FastAPI server using uvicorn
+# Start the server
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "10000"]
-
