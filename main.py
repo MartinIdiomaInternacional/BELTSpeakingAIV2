@@ -14,16 +14,14 @@ import random
 import uuid
 import openai
 
-# ==============================
-# Initialize OpenAI Client (Legacy Syntax)
-# ==============================
+# Load API key
 openai.api_key = os.getenv("OPENAI_API_KEY")
 
 app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # you can restrict this to your GitHub Pages domain
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,7 +32,7 @@ wav2vec_model = WAV2VEC2_BASE.get_model()
 hubert_model = HUBERT_BASE.get_model()
 
 # ==============================
-# Question bank (20 questions per CEFR level)
+# Question bank per CEFR level (20 questions each)
 # ==============================
 questions = {
     "A1": [
@@ -171,14 +169,9 @@ questions = {
     ]
 }
 
-# ==============================
-# Session storage
-# ==============================
 sessions = {}
 
-# ==============================
 # Helper functions
-# ==============================
 def classify_cefr_level(value, thresholds):
     if value < thresholds[0]: return "A1"
     elif value < thresholds[1]: return "A2"
@@ -207,11 +200,8 @@ def extract_deep_features(waveform, sr, model):
 def transcribe_audio(file_path):
     try:
         with open(file_path, "rb") as audio_file:
-            transcript = openai.Audio.transcriptions.create(
-                model="whisper-1",
-                file=audio_file
-            )
-        return transcript["text"] if transcript and "text" in transcript else ""
+            transcript = openai.Audio.transcribe("whisper-1", audio_file)
+        return transcript.get("text", "")
     except Exception as e:
         print("Transcription error:", e)
         return ""
@@ -232,7 +222,7 @@ def analyze_text(transcript):
     """
     try:
         response = openai.ChatCompletion.create(
-            model="gpt-4",
+            model="gpt-3.5-turbo",
             messages=[{"role": "user", "content": prompt}]
         )
         return response.choices[0].message["content"]
@@ -240,12 +230,10 @@ def analyze_text(transcript):
         print("Analysis error:", e)
         return '{"grammar": {"level":"A1","explanation":"Minimal analysis."}}'
 
-# ==============================
-# API Endpoints
-# ==============================
+# API endpoints
 @app.get("/")
 async def root():
-    return {"message": "CEFR Speaking Evaluator API v5.0 is running"}
+    return {"message": "CEFR Speaking Evaluator API is running (patched)"}
 
 @app.post("/start_test")
 async def start_test():
@@ -277,18 +265,18 @@ async def next_question(session_id: str = Form(...), file: UploadFile = File(...
 
         current_level = sessions[session_id]["current_level"]
         level_order = ["A1","A2","B1","B2","C1","C2"]
-        current_idx = level_order.index(current_level)
+        next_idx = level_order.index(current_level)
 
-        # Increase difficulty if high level
         if pron_level in ["B2","C1","C2"] or "B2" in text_eval or "C" in text_eval:
-            current_idx = min(current_idx+1, 5)
+            next_idx = min(next_idx+1, 5)
 
-        next_level = level_order[current_idx]
+        next_level = level_order[next_idx]
         sessions[session_id]["current_level"] = next_level
 
         if sessions[session_id]["questions_asked"] >= 6:
             return JSONResponse({"done": True})
 
+        # Pick a question not asked before
         available_questions = [q for q in questions[next_level] if q not in sessions[session_id]["asked_questions"]]
         next_q = random.choice(available_questions) if available_questions else random.choice(questions[next_level])
         sessions[session_id]["asked_questions"].append(next_q)
@@ -308,6 +296,5 @@ async def final_result(session_id: str = Form(...)):
     final_level = max(set(levels), key=levels.count) if levels else "A1"
     return JSONResponse({"overall_level": final_level, "details": answers})
 
-# Run server
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
