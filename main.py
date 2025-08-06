@@ -124,18 +124,19 @@ def estimate_level_embedding(embedding):
     energy = np.linalg.norm(embedding)
     return classify_cefr_level(energy, [85, 100, 115, 130, 145])
 
-def extract_deep_features(waveform, sr, model):
-    if sr != 16000:
-        waveform = torchaudio.functional.resample(waveform, sr, 16000)
-    with torch.inference_mode():
-        output = model(waveform)
-        if isinstance(output, tuple):
-            for item in output:
-                if isinstance(item, torch.Tensor):
-                    return item.mean(dim=1).squeeze().numpy()
-        elif hasattr(output, 'extractor_features'):
-            return output.extractor_features.mean(dim=1).squeeze().numpy()
-    return np.array([0.0])
+def extract_deep_features(waveform, sample_rate, model):
+    # ... your pre-processing here ...
+
+    # OLD (raises AttributeError):
+    # features = model(waveform).extractor_features
+
+    # NEW: unpack the tuple
+    outputs = model(waveform)
+    # assume outputs[0] is the extractor features
+    features = outputs[0]
+
+    # ... your post-processing here ...
+    return features
 
 def transcribe_audio(file_path):
     try:
