@@ -124,19 +124,40 @@ def estimate_level_embedding(embedding):
     energy = np.linalg.norm(embedding)
     return classify_cefr_level(energy, [85, 100, 115, 130, 145])
 
-def extract_deep_features(waveform, sample_rate, model):
-    # ... your pre-processing here ...
+def extract_deep_features(waveform, sr, model, target_sr=16000, device="cpu"):
+    import torch, torchaudio
 
-    # OLD (raises AttributeError):
-    # features = model(waveform).extractor_features
+    # waveform: torch.Tensor [1, T], float32 in [-1, 1]
+    if sr != target_sr:
+        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
+        sr = target_sr
 
-    # NEW: unpack the tuple
-    outputs = model(waveform)
-    # assume outputs[0] is the extractor features
-    features = outputs[0]
+    waveform = waveform.to(device)
+    model = model.to(device).eval()
 
-    # ... your post-processing here ...
-    return features
+    with torch.inference_mode():
+        # Prefer explicit feature extractor when available (torchaudio)
+        if hasattr(model, "extract_features"):
+            feats, lengths = model.extract_features(waveform)  # feats can be list[Tensors] or a Tensor
+            feats = feats[-1] if isinstance(feats, (list, tuple)) else feats
+        else:
+            out = model(waveform)
+            if isinstance(out, tuple):
+                # torchaudio often returns (feats, lengths); feats may itself be a list per layer
+                feats = out[0]
+                feats = feats[-1] if isinstance(feats, (list, tuple)) else feats
+            elif hasattr(out, "extract_features"):      # HF Wav2Vec2ModelOutput
+                feats = out.extract_features
+            elif hasattr(out, "last_hidden_state"):     # HF base model output
+                feats = out.last_hidden_state
+            else:
+                raise TypeError(f"Unsupported model output type: {type(out)}")
+
+        # Pool to a single embedding (mean over time) and L2-normalize
+        emb = feats.mean(dim=1)                         # [B, C]
+        emb = torch.nn.functional.normalize(emb, dim=-1)
+        return emb.squeeze(0).detach().cpu().numpy()
+
 
 def transcribe_audio(file_path):
     try:
