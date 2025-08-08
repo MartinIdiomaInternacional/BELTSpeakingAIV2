@@ -124,40 +124,22 @@ def estimate_level_embedding(embedding):
     energy = np.linalg.norm(embedding)
     return classify_cefr_level(energy, [85, 100, 115, 130, 145])
 
-def extract_deep_features(waveform, sr, model, target_sr=16000, device="cpu"):
-    import torch, torchaudio
-
-    # waveform: torch.Tensor [1, T], float32 in [-1, 1]
-    if sr != target_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
-        sr = target_sr
-
-    waveform = waveform.to(device)
-    model = model.to(device).eval()
-
-    with torch.inference_mode():
-        # Prefer explicit feature extractor when available (torchaudio)
+def extract_deep_features(waveform: torch.Tensor, sr: int, model):
+    model.eval()
+    with torch.no_grad():
+        # torchaudio wav2vec2 / hubert path
         if hasattr(model, "extract_features"):
-            feats, lengths = model.extract_features(waveform)  # feats can be list[Tensors] or a Tensor
-            feats = feats[-1] if isinstance(feats, (list, tuple)) else feats
+            feats, lengths = model.extract_features(waveform)  # (list-of-layers or tensor, B)
+            if isinstance(feats, list):     # torchaudio returns list per layer
+                feats = feats[-1]           # use last layer [B, T, C]
         else:
-            out = model(waveform)
-            if isinstance(out, tuple):
-                # torchaudio often returns (feats, lengths); feats may itself be a list per layer
-                feats = out[0]
-                feats = feats[-1] if isinstance(feats, (list, tuple)) else feats
-            elif hasattr(out, "extract_features"):      # HF Wav2Vec2ModelOutput
-                feats = out.extract_features
-            elif hasattr(out, "last_hidden_state"):     # HF base model output
-                feats = out.last_hidden_state
-            else:
-                raise TypeError(f"Unsupported model output type: {type(out)}")
+            # Hugging Face path (if you ever swap models)
+            out = model(waveform, output_hidden_states=True)
+            feats = getattr(out, "extract_features", getattr(out, "last_hidden_state", out))
 
-        # Pool to a single embedding (mean over time) and L2-normalize
-        emb = feats.mean(dim=1)                         # [B, C]
-        emb = torch.nn.functional.normalize(emb, dim=-1)
-        return emb.squeeze(0).detach().cpu().numpy()
-
+        # Global mean pool over time to get a fixed-size embedding: [B, C]
+        emb = feats.mean(dim=1)
+        return emb
 
 def transcribe_audio(file_path):
     try:
