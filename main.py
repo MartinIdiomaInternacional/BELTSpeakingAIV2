@@ -124,22 +124,34 @@ def estimate_level_embedding(embedding):
     energy = np.linalg.norm(embedding)
     return classify_cefr_level(energy, [85, 100, 115, 130, 145])
 
-def extract_deep_features(waveform: torch.Tensor, sr: int, model):
-    model.eval()
-    with torch.no_grad():
-        # torchaudio wav2vec2 / hubert path
-        if hasattr(model, "extract_features"):
-            feats, lengths = model.extract_features(waveform)  # (list-of-layers or tensor, B)
-            if isinstance(feats, list):     # torchaudio returns list per layer
-                feats = feats[-1]           # use last layer [B, T, C]
-        else:
-            # Hugging Face path (if you ever swap models)
-            out = model(waveform, output_hidden_states=True)
-            feats = getattr(out, "extract_features", getattr(out, "last_hidden_state", out))
+def extract_deep_features(waveform, sr, model):
+    import torch, torchaudio
 
-        # Global mean pool over time to get a fixed-size embedding: [B, C]
-        emb = feats.mean(dim=1)
-        return emb
+    model.eval()
+    if waveform.dim() == 1:
+        waveform = waveform.unsqueeze(0)
+
+    # torchaudio wav2vec2/hubert expect 16k mono
+    if sr != 16000:
+        waveform = torchaudio.functional.resample(waveform, sr, 16000)
+
+    with torch.inference_mode():
+        out = model(waveform)
+
+        # torchaudio returns (features, lengths)
+        if isinstance(out, (tuple, list)):
+            feats = out[0]
+        # fairseq/huggingface style fallbacks (in case you swap models later)
+        elif hasattr(out, "extractor_features"):
+            feats = out.extractor_features
+        elif hasattr(out, "last_hidden_state"):
+            feats = out.last_hidden_state
+        else:
+            feats = out
+
+    # simple temporal pooling -> embedding
+    emb = feats.mean(dim=1)
+    return emb
 
 def transcribe_audio(file_path):
     try:
