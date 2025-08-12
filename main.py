@@ -124,34 +124,40 @@ def estimate_level_embedding(embedding):
     energy = np.linalg.norm(embedding)
     return classify_cefr_level(energy, [85, 100, 115, 130, 145])
 
-def extract_deep_features(waveform, sr, model):
+def extract_deep_features(waveform, sr, model, target_sr=16000):
     import torch, torchaudio
 
-    model.eval()
-    if waveform.dim() == 1:
+    # shape & rate
+    if waveform.ndim == 1:
         waveform = waveform.unsqueeze(0)
+    if sr != target_sr:
+        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
 
-    # torchaudio wav2vec2/hubert expect 16k mono
-    if sr != 16000:
-        waveform = torchaudio.functional.resample(waveform, sr, 16000)
+    device = next(model.parameters()).device
+    model.eval()
+    waveform = waveform.to(device)
 
     with torch.inference_mode():
-        out = model(waveform)
-
-        # torchaudio returns (features, lengths)
-        if isinstance(out, (tuple, list)):
-            feats = out[0]
-        # fairseq/huggingface style fallbacks (in case you swap models later)
-        elif hasattr(out, "extractor_features"):
-            feats = out.extractor_features
-        elif hasattr(out, "last_hidden_state"):
-            feats = out.last_hidden_state
+        # try modern API
+        if hasattr(model, "extract_features"):
+            feats, _ = model.extract_features(waveform)  # list of layer tensors
+            x = feats[-1]                                # take last layer (B, T, C)
         else:
-            feats = out
+            out = model(waveform)
+            if isinstance(out, (tuple, list)):
+                x = out[0]
+            elif hasattr(out, "extractor_features"):
+                x = out.extractor_features
+            else:
+                x = out
 
-    # simple temporal pooling -> embedding
-    emb = feats.mean(dim=1)
+        if x.dim() == 2:
+            x = x.unsqueeze(0)
+
+        emb = x.mean(dim=1).cpu()  # (B, C)
     return emb
+
+
 
 def transcribe_audio(file_path):
     try:
@@ -256,4 +262,5 @@ async def final_result(session_id: str = Form(...)):
 # Run server
 # ==============================
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 10000)))
+
