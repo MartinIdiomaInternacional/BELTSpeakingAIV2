@@ -5,6 +5,11 @@ import librosa
 import numpy as np
 import torch
 import torchaudio
+if sr_torch != 16000:
+    waveform = torchaudio.functional.resample(waveform, sr_torch, 16000)
+if waveform.dim() == 1:
+    waveform = waveform.unsqueeze(0)  # (1, T)
+waveform = waveform.float()
 from torchaudio.pipelines import WAV2VEC2_BASE, HUBERT_BASE
 import uvicorn
 import tempfile
@@ -124,40 +129,59 @@ def estimate_level_embedding(embedding):
     energy = np.linalg.norm(embedding)
     return classify_cefr_level(energy, [85, 100, 115, 130, 145])
 
-def extract_deep_features(waveform, sr, model, target_sr=16000):
-    import torch, torchaudio
-
-    # shape & rate
-    if waveform.ndim == 1:
-        waveform = waveform.unsqueeze(0)
-    if sr != target_sr:
-        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
-
-    device = next(model.parameters()).device
+import torch
+def extract_deep_features(waveform: torch.Tensor, sr: int, model) -> torch.Tensor:
+    """
+    waveform: (1, num_samples) float32, mono
+    sr:       sample rate of waveform
+    model:    wav2vec2 / hubert model
+    returns:  (feature_dim,) pooled embedding
+    """
     model.eval()
-    waveform = waveform.to(device)
 
-    with torch.inference_mode():
-        # try modern API
-        if hasattr(model, "extract_features"):
-            feats, _ = model.extract_features(waveform)  # list of layer tensors
-            x = feats[-1]                                # take last layer (B, T, C)
+    # If you're using a torchaudio pipeline bundle, enforce the expected sample rate.
+    try:
+        target_sr = getattr(model, "sample_rate", None) or getattr(getattr(model, "bundle", None), "sample_rate", None)
+    except Exception:
+        target_sr = None
+    if target_sr and sr != target_sr:
+        import torchaudio
+        waveform = torchaudio.functional.resample(waveform, sr, target_sr)
+        sr = target_sr
+
+    with torch.no_grad():
+        out = model(waveform)
+
+        # torchaudio Wav2Vec2ModelOutput (namedtuple) OR plain tuple
+        if hasattr(out, "extractor_features"):
+            feats = out.extractor_features
+        elif hasattr(out, "encoder_features"):
+            feats = out.encoder_features
+        elif hasattr(out, "last_hidden_state"):  # transformers-style
+            feats = out.last_hidden_state
+        elif isinstance(out, (list, tuple)) and len(out) > 0:
+            # torchaudio sometimes returns (extractor, encoder) as a tuple
+            feats = out[0]
         else:
-            out = model(waveform)
-            if isinstance(out, (tuple, list)):
-                x = out[0]
-            elif hasattr(out, "extractor_features"):
-                x = out.extractor_features
-            else:
-                x = out
+            # fallback: assume the forward directly returns features tensor
+            feats = out
 
-        if x.dim() == 2:
-            x = x.unsqueeze(0)
+        # feats expected shape: (B, T, C) or (B, C, T) depending on model
+        if feats.dim() == 3:
+            # make it (B, T, C)
+            if feats.shape[1] in (80, 256, 512) and feats.shape[2] > feats.shape[1]:
+                # likely (B, C, T) -> swap
+                feats = feats.transpose(1, 2)
+            # mean-pool over time
+            emb = feats.mean(dim=1).squeeze(0)
+        elif feats.dim() == 2:
+            # already (B, C)
+            emb = feats.squeeze(0)
+        else:
+            # unexpected; flatten as last resort
+            emb = feats.reshape(-1)
 
-        emb = x.mean(dim=1).cpu()  # (B, C)
-    return emb
-
-
+        return emb
 
 def transcribe_audio(file_path):
     try:
@@ -219,7 +243,7 @@ async def next_question(session_id: str = Form(...), file: UploadFile = File(...
         # Audio features
         y, sr = librosa.load(tmp_path, sr=16000)
         waveform, sr_torch = torchaudio.load(tmp_path)
-        emb = extract_deep_features(waveform, sr_torch, wav2vec_model)
+        emb_w2v = extract_deep_features(waveform, sr_torch, wav2vec_model)
         pron_level = estimate_level_embedding(emb)
 
         # Transcription and analysis
