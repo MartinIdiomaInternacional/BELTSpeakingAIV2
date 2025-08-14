@@ -1,32 +1,46 @@
-# BELT Speaking Test API - Dockerfile (Render-friendly, includes prompts.json)
+# ---- Base image ----
 FROM python:3.11-slim
 
-# System deps for audio
-RUN apt-get update && apt-get install -y --no-install-recommends         ffmpeg         libsndfile1     && rm -rf /var/lib/apt/lists/*
+# ---- System deps ----
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    libsndfile1 \
+ && rm -rf /var/lib/apt/lists/*
 
-# Keep things light & predictable
-ENV PYTHONDONTWRITEBYTECODE=1     PYTHONUNBUFFERED=1     OMP_NUM_THREADS=1     MKL_NUM_THREADS=1     BELT_SAFE_MODE=1     PIP_DISABLE_PIP_VERSION_CHECK=1     PROMPTS_PATH=/app/prompts.json
+# ---- Env defaults (override in Render dashboard if needed) ----
+# SAFE mode skips local SSL/ASR (faster start, smaller RAM).
+ENV BELT_SAFE_MODE=0 \
+    HYBRID_W_AUDIO=0.5 \
+    HYBRID_W_TEXT=0.5 \
+    HYBRID_W_REL=0.2 \
+    T_A2=0.25 \
+    T_B1=0.40 \
+    T_B2=0.60 \
+    T_C1=0.75 \
+    USE_OPENAI_ASR=0 \
+    OPENAI_ASR_MODEL=whisper-1 \
+    USE_OPENAI_EMBED=1 \
+    OPENAI_EMBED_MODEL=text-embedding-3-small \
+    PROMPTS_PATH=/app/prompts.json \
+    OMP_NUM_THREADS=1 \
+    MKL_NUM_THREADS=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
 
+# ---- App dir ----
 WORKDIR /app
 
-# Base deps (SAFE)
+# ---- Python deps ----
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Optional FULL deps (SSL features)
-ARG INCLUDE_TORCH=0
-COPY requirements-full.txt /app/requirements-full.txt
-RUN if [ "$INCLUDE_TORCH" = "1" ]; then pip install --no-cache-dir -r /app/requirements-full.txt; fi
-
-# Optional extras
-ARG INCLUDE_EXTRAS=0
-COPY requirements-extras.txt /app/requirements-extras.txt
-RUN if [ "$INCLUDE_EXTRAS" = "1" ]; then pip install --no-cache-dir -r /app/requirements-extras.txt; fi
-
-# App code and prompts
+# ---- App code ----
 COPY main.py /app/main.py
+# prompts.json is optional here; comment out this line if you manage prompts separately
 COPY prompts.json /app/prompts.json
 
-# Render provides $PORT; fall back to 8000 for local
+# ---- Runtime ----
 EXPOSE 8000
-CMD ["sh","-c","uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
+CMD ["uvicorn", "main:app", "--host=0.0.0.0", "--port=8000"]
