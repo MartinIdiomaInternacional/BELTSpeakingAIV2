@@ -1,13 +1,21 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
+
+# Torch stack
 torch==2.3.1
 torchaudio==2.3.1
-numpy==2.0.1
+
+# Numpy/Numba combo compatible with librosa on Py3.11
+numpy==1.26.4
+numba==0.58.1
+
+# Audio & utils
 soundfile==0.12.1
 librosa==0.10.1
 python-multipart==0.0.9
+
+# Extras you listed
 scikit-learn==1.4.2
 gTTS==2.5.3
 openai==1.37.1
 requests==2.32.3
-numba==0.58.1
