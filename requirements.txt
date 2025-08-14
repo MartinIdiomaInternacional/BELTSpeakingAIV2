@@ -1,20 +1,18 @@
 fastapi==0.115.0
 uvicorn[standard]==0.30.6
 
-# Torch stack
+# PyTorch CPU (for local SSL/ASR in FULL mode)
 torch==2.3.1
 torchaudio==2.3.1
 
-# Numpy/Numba combo compatible with librosa on Py3.11
+# Librosa stack – pinned to avoid NumPy/Numba lock conflicts
 numpy==1.26.4
 numba==0.58.1
-
-# Audio & utils
 soundfile==0.12.1
 librosa==0.10.1
-python-multipart==0.0.9
 
-# Extras you listed
+# Uploads & utilities
+python-multipart==0.0.9
 scikit-learn==1.4.2
 gTTS==2.5.3
 openai==1.37.1
