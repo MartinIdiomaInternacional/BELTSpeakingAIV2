@@ -3,25 +3,33 @@ from pathlib import Path
 from functools import lru_cache
 from typing import Optional, Tuple
 
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 import numpy as np
 import librosa
 
-APP_VERSION = "BELT Speaking Test API v0.7-hybrid (2025-08-14)"
+APP_VERSION = "BELT Speaking Test API v0.8-hybrid+relevance (2025-08-14)"
 SAFE_MODE = os.getenv("BELT_SAFE_MODE", "0") == "1"
 
-# Weights for hybrid scoring (override via env)
+# ----- Weights (override via env) -----
 HYBRID_W_AUDIO = float(os.getenv("HYBRID_W_AUDIO", "0.5"))
-HYBRID_W_TEXT  = float(os.getenv("HYBRID_W_TEXT", "0.5"))
+HYBRID_W_TEXT  = float(os.getenv("HYBRID_W_TEXT",  "0.5"))
+HYBRID_W_REL   = float(os.getenv("HYBRID_W_REL",   "0.2"))   # NEW: relevance weight
 
-# CEFR band thresholds (0..1 -> bands)
+# ----- CEFR thresholds (0..1 -> bands) -----
 T_A2 = float(os.getenv("T_A2", "0.25"))
 T_B1 = float(os.getenv("T_B1", "0.40"))
 T_B2 = float(os.getenv("T_B2", "0.60"))
 T_C1 = float(os.getenv("T_C1", "0.75"))
+
+# ----- ASR / Embeddings config -----
+USE_OPENAI_ASR   = os.getenv("USE_OPENAI_ASR", "0") == "1"
+OPENAI_ASR_MODEL = os.getenv("OPENAI_ASR_MODEL", "whisper-1")
+
+USE_OPENAI_EMBED   = os.getenv("USE_OPENAI_EMBED", "1") == "1"
+OPENAI_EMBED_MODEL = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 
 # ---------- App ----------
 app = FastAPI(title="BELT Speaking Test API", version=APP_VERSION)
@@ -98,7 +106,7 @@ _SSL_MODEL = None
 _SSL_MODEL_NAME = None
 
 def get_ssl_embedding(y_16k: np.ndarray):
-    # Compute an SSL embedding variance signal. Skipped in SAFE mode.
+    """Compute an SSL embedding variance signal. Skipped in SAFE mode."""
     global _SSL_MODEL, _SSL_MODEL_NAME
     if SAFE_MODE:
         return None, None, "SAFE_MODE_DISABLED_SSL"
@@ -132,8 +140,7 @@ def get_ssl_embedding(y_16k: np.ndarray):
 
 # ---------- Optional ASR (cloud or local) ----------
 def _get_asr_mode():
-    # Decide which ASR provider to use: openai / local / none
-    use_openai = os.getenv("USE_OPENAI_ASR", "0") == "1" and os.getenv("OPENAI_API_KEY")
+    use_openai = USE_OPENAI_ASR and os.getenv("OPENAI_API_KEY")
     if use_openai:
         return "openai"
     if not SAFE_MODE:
@@ -143,7 +150,7 @@ def _get_asr_mode():
 _ASR_MODEL = None
 _ASR_BUNDLE = None
 def _local_asr_transcribe(y_16k: np.ndarray) -> Optional[str]:
-    # Greedy CTC decode using torchaudio's wav2vec2 ASR base. Returns lowercased transcript or None.
+    """Greedy CTC decode using torchaudio's wav2vec2 ASR base. Returns lowercased transcript or None."""
     global _ASR_MODEL, _ASR_BUNDLE
     try:
         import torch, torchaudio
@@ -155,7 +162,7 @@ def _local_asr_transcribe(y_16k: np.ndarray) -> Optional[str]:
             emissions, _ = _ASR_MODEL(waveform)
             indices = emissions[0].argmax(dim=-1).tolist()
         labels = _ASR_BUNDLE.get_labels()
-        blank_idx = 0  # by convention in this bundle
+        blank_idx = 0  # by convention
         tokens, last = [], None
         for i in indices:
             if i != blank_idx and i != last:
@@ -167,20 +174,19 @@ def _local_asr_transcribe(y_16k: np.ndarray) -> Optional[str]:
         return None
 
 def _openai_asr_transcribe(tmp_path: str) -> Optional[str]:
-    # Use OpenAI Whisper API if configured. Returns lowercased transcript or None.
+    """Use OpenAI Whisper API if configured. Returns lowercased transcript or None."""
     try:
         from openai import OpenAI
         client = OpenAI()
-        model = os.getenv("OPENAI_ASR_MODEL", "whisper-1")
         with open(tmp_path, "rb") as f:
-            resp = client.audio.transcriptions.create(model=model, file=f)
+            resp = client.audio.transcriptions.create(model=OPENAI_ASR_MODEL, file=f)
         text = getattr(resp, "text", None) or (resp.get("text") if isinstance(resp, dict) else None)
         return (str(text).strip().lower()) if text else None
     except Exception:
         return None
 
 def get_transcript(y_16k: np.ndarray, tmp_path: str) -> Tuple[Optional[str], str]:
-    # Return (transcript, provider).
+    """Return (transcript, provider)."""
     mode = _get_asr_mode()
     if mode == "openai":
         t = _openai_asr_transcribe(tmp_path)
@@ -230,105 +236,14 @@ def text_score_component(tf):
     filler_penalty = 1.0 - _normalize(tf["filler_ratio"], 0.02, 0.12)
     return float(0.5*wpm_n + 0.3*lex_n + 0.2*filler_penalty)
 
-def map_score_to_level(score):
-    if score < T_A2:   return "A1-A2 (provisional)"
-    if score < T_B1:   return "A2-B1 (provisional)"
-    if score < T_B2:   return "B1-B2 (provisional)"
-    if score < T_C1:   return "B2-C1 (provisional)"
-    return "C1-C2 (provisional)"
+# ---------- Relevance / Coherence ----------
+STOP = {"the","a","an","to","of","in","on","for","with","and","or","but","is","are","was","were","be","am","as","at","by",
+        "it","this","that","i","you","he","she","they","we","my","your","our"}
 
-def hybrid_infer(y, metrics, ssl_var, transcript):
-    a = audio_score_component(metrics, ssl_var)
-    t = text_score_component(text_features(transcript, metrics["duration_sec"])) if transcript else 0.0
-    score = HYBRID_W_AUDIO * a + HYBRID_W_TEXT * t
-    level = map_score_to_level(score)
-    return score, a, t, level
+def _tokens(t: str):
+    return {w for w in re.findall(r"[a-zA-Z']+", (t or "").lower()) if w not in STOP}
 
-# ---------- Routes ----------
-@app.get("/health")
-async def health():
-    mode = "SAFE" if SAFE_MODE else "FULL"
-    prompts = load_prompts()
-    levels = sorted(list(prompts.keys()))
-    return {"status": "ok", "version": APP_VERSION, "mode": mode, "prompt_levels": levels}
-
-@app.get("/config")
-async def config():
-    return {
-        "mode": "SAFE" if SAFE_MODE else "FULL",
-        "weights": {"audio": HYBRID_W_AUDIO, "text": HYBRID_W_TEXT},
-        "thresholds": {"A2": T_A2, "B1": T_B1, "B2": T_B2, "C1": T_C1},
-        "asr_mode": _get_asr_mode(),
-    }
-
-def _evaluate_core(tmp_path: str) -> dict:
-    y, sr = load_audio_to_16k_mono(tmp_path)
-    y = y / (np.max(np.abs(y)) + 1e-8)
-    metrics = speech_activity_metrics(y, sr=sr)
-    emb, ssl_var, ssl_name = get_ssl_embedding(y)
-    transcript, asr_provider = get_transcript(y, tmp_path)
-    score, a_comp, t_comp, level = hybrid_infer(y, metrics, ssl_var, transcript)
-    return {
-        "ok": True,
-        "mode": "SAFE" if SAFE_MODE else "FULL",
-        "ssl_model": ssl_name,
-        "asr_provider": asr_provider,
-        "duration_sec": metrics["duration_sec"],
-        "voiced_ratio": metrics["voiced_ratio"],
-        "segments": metrics["num_segments"],
-        "avg_segment_sec": metrics["avg_segment_sec"],
-        "long_pauses": metrics["long_pauses"],
-        "embedding_norm": float(np.linalg.norm(emb)) if emb is not None else None,
-        "feature_variance": ssl_var,
-        "transcript": transcript,
-        "scores": {"hybrid": score, "audio": a_comp, "text": t_comp},
-        "provisional_level": level,
-    }
-
-@app.post("/evaluate")
-async def evaluate(file: UploadFile = File(...)):
-    if not file.filename.lower().endswith((".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm")):
-        raise HTTPException(status_code=400, detail="Unsupported file type. Please upload audio (wav/mp3/m4a/flac/ogg/webm).")
-    try:
-        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1]) as tmp:
-            data = await file.read()
-            tmp.write(data)
-            tmp_path = tmp.name
-        result = _evaluate_core(tmp_path)
-        return JSONResponse(content=result)
-    except Exception as e:
-        tb = traceback.format_exc()
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}\n{tb}")
-    finally:
-        try:
-            if 'tmp_path' in locals() and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except Exception:
-            pass
-
-@app.post("/evaluate-bytes")
-async def evaluate_bytes(request: Request):
-    try:
-        data = await request.body()
-        if not data:
-            raise HTTPException(status_code=400, detail="Empty request body")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
-            tmp.write(data)
-            tmp_path = tmp.name
-        result = _evaluate_core(tmp_path)
-        return JSONResponse(content=result)
-    except Exception as e:
-        tb = traceback.format_exc()
-        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}\n{tb}")
-    finally:
-        try:
-            if 'tmp_path' in locals() and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except Exception:
-            pass
-
-if __name__ == "__main__":
-    os.environ.setdefault("OMP_NUM_THREADS", "1")
-    os.environ.setdefault("MKL_NUM_THREADS", "1")
-    import uvicorn
-    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
+def relevance_heuristic(question: str, transcript: str) -> float:
+    q = _tokens(question); a = _tokens(transcript)
+    if not q or not a: return 0.0
+    inter = len(q & a); union = len(q | a)
