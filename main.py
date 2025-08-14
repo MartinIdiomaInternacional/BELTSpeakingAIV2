@@ -247,3 +247,134 @@ def relevance_heuristic(question: str, transcript: str) -> float:
     q = _tokens(question); a = _tokens(transcript)
     if not q or not a: return 0.0
     inter = len(q & a); union = len(q | a)
+    jacc = inter / union
+    recall = inter / len(q)
+    return float(0.6*jacc + 0.4*recall)
+
+def relevance_openai(question: str, transcript: str) -> float:
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        m = OPENAI_EMBED_MODEL
+        qv = client.embeddings.create(model=m, input=question).data[0].embedding
+        av = client.embeddings.create(model=m, input=transcript).data[0].embedding
+        import math
+        dot = sum(x*y for x,y in zip(qv, av))
+        nq = math.sqrt(sum(x*x for x in qv)); na = math.sqrt(sum(x*x for x in av))
+        return float(dot/(nq*na + 1e-9))
+    except Exception:
+        return relevance_heuristic(question, transcript)
+
+def hybrid_infer(y, metrics, ssl_var, transcript, question=None):
+    a = audio_score_component(metrics, ssl_var)
+    t = text_score_component(text_features(transcript, metrics["duration_sec"])) if transcript else 0.0
+    r = 0.0
+    if transcript and question:
+        if USE_OPENAI_EMBED and os.getenv("OPENAI_API_KEY"):
+            r = relevance_openai(question, transcript)
+        else:
+            r = relevance_heuristic(question, transcript)
+    w_sum = HYBRID_W_AUDIO + HYBRID_W_TEXT + HYBRID_W_REL
+    score = (HYBRID_W_AUDIO*a + HYBRID_W_TEXT*t + HYBRID_W_REL*r) / (w_sum if w_sum>0 else 1.0)
+    level = map_score_to_level(score)
+    return score, a, t, r, level
+
+def map_score_to_level(score):
+    if score < T_A2:   return "A1-A2 (provisional)"
+    if score < T_B1:   return "A2-B1 (provisional)"
+    if score < T_B2:   return "B1-B2 (provisional)"
+    if score < T_C1:   return "B2-C1 (provisional)"
+    return "C1-C2 (provisional)"
+
+# ---------- Routes ----------
+@app.get("/health")
+async def health():
+    mode = "SAFE" if SAFE_MODE else "FULL"
+    prompts = load_prompts()
+    levels = sorted(list(prompts.keys()))
+    return {"status": "ok", "version": APP_VERSION, "mode": mode, "prompt_levels": levels}
+
+@app.get("/config")
+async def config():
+    embed_mode = "openai" if (USE_OPENAI_EMBED and os.getenv("OPENAI_API_KEY")) else "heuristic"
+    return {
+        "mode": "SAFE" if SAFE_MODE else "FULL",
+        "weights": {"audio": HYBRID_W_AUDIO, "text": HYBRID_W_TEXT, "relevance": HYBRID_W_REL},
+        "thresholds": {"A2": T_A2, "B1": T_B1, "B2": T_B2, "C1": T_C1},
+        "asr_mode": _get_asr_mode(),
+        "embed_mode": embed_mode,
+    }
+
+def _evaluate_core(tmp_path: str, question: Optional[str] = None) -> dict:
+    y, sr = load_audio_to_16k_mono(tmp_path)
+    y = y / (np.max(np.abs(y)) + 1e-8)
+    metrics = speech_activity_metrics(y, sr=sr)
+    emb, ssl_var, ssl_name = get_ssl_embedding(y)
+    transcript, asr_provider = get_transcript(y, tmp_path)
+    score, a_comp, t_comp, rel, level = hybrid_infer(y, metrics, ssl_var, transcript, question)
+    return {
+        "ok": True,
+        "mode": "SAFE" if SAFE_MODE else "FULL",
+        "ssl_model": ssl_name,
+        "asr_provider": asr_provider,
+        "question_echo": question,
+        "duration_sec": metrics["duration_sec"],
+        "voiced_ratio": metrics["voiced_ratio"],
+        "segments": metrics["num_segments"],
+        "avg_segment_sec": metrics["avg_segment_sec"],
+        "long_pauses": metrics["long_pauses"],
+        "embedding_norm": float(np.linalg.norm(emb)) if emb is not None else None,
+        "feature_variance": ssl_var,
+        "transcript": transcript,
+        "scores": {"hybrid": score, "audio": a_comp, "text": t_comp, "relevance": rel},
+        "provisional_level": level,
+    }
+
+@app.post("/evaluate")
+async def evaluate(file: UploadFile = File(...), question: Optional[str] = Form(None)):
+    if not file.filename.lower().endswith((".wav", ".mp3", ".m4a", ".flac", ".ogg", ".webm")):
+        raise HTTPException(status_code=400, detail="Unsupported file type. Please upload audio (wav/mp3/m4a/flac/ogg/webm).")
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=os.path.splitext(file.filename)[-1]) as tmp:
+            data = await file.read()
+            tmp.write(data)
+            tmp_path = tmp.name
+        result = _evaluate_core(tmp_path, question)
+        return JSONResponse(content=result)
+    except Exception as e:
+        tb = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}\n{tb}")
+    finally:
+        try:
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+
+@app.post("/evaluate-bytes")
+async def evaluate_bytes(request: Request):
+    try:
+        data = await request.body()
+        if not data:
+            raise HTTPException(status_code=400, detail="Empty request body")
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
+            tmp.write(data)
+            tmp_path = tmp.name
+        question = request.headers.get("x-question")
+        result = _evaluate_core(tmp_path, question)
+        return JSONResponse(content=result)
+    except Exception as e:
+        tb = traceback.format_exc()
+        raise HTTPException(status_code=500, detail=f"Processing error: {str(e)}\n{tb}")
+    finally:
+        try:
+            if 'tmp_path' in locals() and os.path.exists(tmp_path):
+                os.unlink(tmp_path)
+        except Exception:
+            pass
+
+if __name__ == "__main__":
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    import uvicorn
+    uvicorn.run("main:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False)
