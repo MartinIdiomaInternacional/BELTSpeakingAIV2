@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: belt-speaking-test
+    env: docker
+    dockerfilePath: Dockerfile.render
+    autoDeploy: true
+    healthCheckPath: /health
+    plan: starter
+    envVars:
+      - key: BELT_SAFE_MODE
+        value: "1"
+      - key: PROMPTS_PATH
+        value: /app/prompts.json
