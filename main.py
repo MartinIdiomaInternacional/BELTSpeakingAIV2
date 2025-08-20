@@ -1,4 +1,4 @@
-import os, json, tempfile, traceback, re, math
+import os, json, tempfile, traceback, re, math, subprocess, sys
 from pathlib import Path
 from functools import lru_cache
 from typing import Optional, Tuple, List, Dict
@@ -12,16 +12,16 @@ import numpy as np
 import librosa
 
 # -------------------- Meta --------------------
-APP_VERSION = "BELT Speaking Test API v1.1 (CEFR 5-dim + richer fluency/pron + band confidence)"
+APP_VERSION = "BELT Speaking Test API v1.1.1 (CEFR 5-dim + robust decode/ASR)"
 SAFE_MODE   = os.getenv("BELT_SAFE_MODE", "0") == "1"
 TEEN_TONE   = os.getenv("TEEN_TONE", "0") == "1"
 
 # -------------------- Weights (0..1) --------------------
-W_REL  = float(os.getenv("W_REL",  "0.20"))     # relevance/coherence to question
+W_REL  = float(os.getenv("W_REL",  "0.20"))     # relevance/coherence
 W_FLU  = float(os.getenv("W_FLU",  "0.30"))     # fluency
 W_GRA  = float(os.getenv("W_GRA",  "0.20"))     # grammar
-W_PRO  = float(os.getenv("W_PRO",  "0.15"))     # pronunciation (proxies)
-W_VOC  = float(os.getenv("W_VOC",  "0.15"))     # vocabulary range/variety
+W_PRO  = float(os.getenv("W_PRO",  "0.15"))     # pronunciation proxies
+W_VOC  = float(os.getenv("W_VOC",  "0.15"))     # vocabulary
 
 # -------------------- CEFR thresholds (0..1) --------------------
 T_A2 = float(os.getenv("T_A2", "0.25"))
@@ -36,7 +36,7 @@ OPENAI_ASR_MODEL     = os.getenv("OPENAI_ASR_MODEL", "whisper-1")
 USE_OPENAI_EMBED     = os.getenv("USE_OPENAI_EMBED", "1") == "1"
 OPENAI_EMBED_MODEL   = os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-small")
 
-USE_OPENAI_GRAMMAR   = os.getenv("USE_OPENAI_GRAMMAR", "0") == "1"    # optional LLM grammar rater (0..1)
+USE_OPENAI_GRAMMAR   = os.getenv("USE_OPENAI_GRAMMAR", "0") == "1"
 OPENAI_GRAMMAR_MODEL = os.getenv("OPENAI_GRAMMAR_MODEL", "gpt-4o-mini")
 
 USE_LLM_FEEDBACK     = os.getenv("USE_LLM_FEEDBACK", "0") == "1"
@@ -66,14 +66,45 @@ async def get_prompts(level: str):
         raise HTTPException(status_code=404, detail=f"No prompts found for level '{level}'.")
     return {"level": lvl, "count": len(prompts[lvl]), "questions": prompts[lvl]}
 
+# -------------------- Small helpers --------------------
+def _normalize(v, lo, hi): return max(0.0, min(1.0, (v - lo) / (hi - lo))) if hi > lo else 0.0
+def _tokens(t: str): return [w for w in re.findall(r"[a-zA-Z']+", (t or "").lower())]
+def _content_tokens(t: str): 
+    STOP = {"the","a","an","to","of","in","on","for","with","and","or","but","is","are","was","were","be","am","as","at","by",
+            "it","this","that","i","you","he","she","they","we","my","your","our","me","him","her","them","us"}
+    return [w for w in _tokens(t) if w not in STOP]
+
+def _guess_ext(content_type: Optional[str]) -> str:
+    ct = (content_type or "").lower()
+    if "wav" in ct: return ".wav"
+    if "webm" in ct: return ".webm"
+    if "ogg" in ct: return ".ogg"
+    if "mpeg" in ct or "mp3" in ct: return ".mp3"
+    if "mp4" in ct or "aac" in ct or "m4a" in ct: return ".m4a"
+    if "flac" in ct: return ".flac"
+    return ".bin"
+
 # -------------------- Audio utils --------------------
 def load_audio_to_16k_mono(path: str):
-    y, sr = librosa.load(path, sr=16000, mono=True)
-    if y.size == 0: return np.zeros((1,), dtype=np.float32), 16000
-    return y.astype(np.float32), 16000
+    """Decode with librosa; if it fails, transcode via ffmpeg to a temp .wav and retry."""
+    try:
+        y, sr = librosa.load(path, sr=16000, mono=True)
+        if y.size == 0:
+            return np.zeros((1,), dtype=np.float32), 16000
+        return y.astype(np.float32), 16000
+    except Exception:
+        wav_path = path + ".wav"
+        try:
+            subprocess.run(
+                ["ffmpeg","-y","-i", path, "-ar","16000","-ac","1", wav_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True
+            )
+            y, sr = librosa.load(wav_path, sr=16000, mono=True)
+            return (y.astype(np.float32) if y.size else np.zeros((1,), dtype=np.float32)), 16000
+        except Exception:
+            return np.zeros((1,), dtype=np.float32), 16000
 
 def voice_intervals(y: np.ndarray, top_db: float = 30.0) -> List[Tuple[int,int]]:
-    # Voiced segments in samples
     return librosa.effects.split(y, top_db=top_db)
 
 def speech_activity_metrics(y: np.ndarray, sr: int = 16000, intervals: Optional[List[Tuple[int,int]]]=None):
@@ -95,7 +126,7 @@ def speech_activity_metrics(y: np.ndarray, sr: int = 16000, intervals: Optional[
     return {"duration_sec": float(duration), "voiced_ratio": float(voiced), "num_segments": int(len(intervals)),
             "avg_segment_sec": avg_seg, "long_pauses": int(long_pauses), "silence_pct": silence_pct}, intervals
 
-# -------------------- Optional SSL features (not used directly in v1.1 score) --------------------
+# -------------------- SSL (optional) --------------------
 _SSL_MODEL = None
 _SSL_MODEL_NAME = None
 def get_ssl_embedding(y_16k: np.ndarray):
@@ -130,7 +161,7 @@ def _get_asr_mode():
 _ASR_MODEL = None
 _ASR_BUNDLE = None
 def _local_asr(y_16k: np.ndarray):
-    # Returns (transcript, mean_max_prob) where mean_max_prob approximates ASR confidence for pronunciation proxy
+    """Return (transcript, conf). Never raise; on failure return (None, None)."""
     try:
         import torch, torchaudio
         global _ASR_MODEL, _ASR_BUNDLE
@@ -140,7 +171,7 @@ def _local_asr(y_16k: np.ndarray):
         wav = torch.tensor(y_16k, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             emissions, _ = _ASR_MODEL(wav)          # (B,T,V)
-            probs = emissions.softmax(dim=-1).max(dim=-1).values.mean().item()  # pronunciation proxy
+            probs = emissions.softmax(dim=-1).max(dim=-1).values.mean().item()
             idx = emissions[0].argmax(dim=-1).tolist()
         labels = _ASR_BUNDLE.get_labels()
         blank = 0
@@ -154,7 +185,7 @@ def _local_asr(y_16k: np.ndarray):
         return None, None
 
 def _openai_whisper(tmp_path: str):
-    # Returns (transcript, None) — Whisper API does not expose token confidences
+    """Return (transcript, None)."""
     try:
         from openai import OpenAI
         client = OpenAI()
@@ -179,17 +210,9 @@ def get_transcript(y_16k: np.ndarray, tmp_path: str):
         return (t, "local", conf) if t else (None, "none", None)
     return None, "none", None
 
-# -------------------- Text helpers & features --------------------
-STOP = {"the","a","an","to","of","in","on","for","with","and","or","but","is","are","was","were","be","am","as","at","by",
-        "it","this","that","i","you","he","she","they","we","my","your","our","me","him","her","them","us"}
+# -------------------- Fluency & extras --------------------
 FILLERS = {"um","uh","er","eh","hmm","like","you","know","kind","of","sort","of"}
-SMALL_3SG = {"go","do","have","want","like","need","think","say","work","live","study","make","take","know","talk","use"}
 
-def _normalize(v, lo, hi): return max(0.0, min(1.0, (v - lo) / (hi - lo))) if hi > lo else 0.0
-def _tokens(t: str): return [w for w in re.findall(r"[a-zA-Z']+", (t or "").lower())]
-def _content_tokens(t: str): return [w for w in _tokens(t) if w not in STOP]
-
-# --- Syllable approximation & extra fluency features ---
 _vowel_groups = re.compile(r"[aeiouy]+", re.I)
 def approx_syllables(text: str) -> int:
     if not text: return 0
@@ -219,7 +242,6 @@ def pitch_stats(y: np.ndarray, sr: int):
     except Exception:
         return {"f0_med": 0.0, "f0_iqr": 0.0}
 
-# ---- Text features for fluency ----
 def text_features(transcript: str, duration_sec: float):
     if not transcript or duration_sec <= 0:
         return {"words":0,"wpm":0.0,"lexical_diversity":0.0,"filler_ratio":0.0}
@@ -247,14 +269,13 @@ def text_fluency_score(tf):
     return 0.55*wpm_n + 0.30*lex_n + 0.15*filler_penalty
 
 def fluency_extra_features(transcript: Optional[str], m: dict, intervals: List[Tuple[int,int]], sr: int):
-    voiced_sec = sum((e - s)/sr for s, e in intervals) if intervals else max(0.2, m["voiced_ratio"]*m["duration_sec"])
-    art_rate = articulation_rate_sps(transcript or "", voiced_sec)  # syl/sec
-    mlr_sec  = mean_length_of_run(intervals, sr)                    # sec
+    voiced_sec = sum((e - s)/sr for s, e in intervals) if intervals else max(0.2, m.get("voiced_ratio",0.0)*m.get("duration_sec",0.0))
+    art_rate = articulation_rate_sps(transcript or "", voiced_sec)
+    mlr_sec  = mean_length_of_run(intervals, sr)
     sil_pct  = float(m.get("silence_pct", 1.0 - m.get("voiced_ratio",0.0)))
-    # Normalize (tune ranges with pilot data)
-    art_n = _normalize(art_rate, 3.0, 5.2)           # good band ~3.5–5.0 syl/s
-    mlr_n = _normalize(mlr_sec, 0.8, 2.2)            # mean run length 0.8–2.2s
-    sil_n = 1.0 - _normalize(sil_pct, 0.20, 0.50)    # prefer ~20–35% silence
+    art_n = _normalize(art_rate, 3.0, 5.2)
+    mlr_n = _normalize(mlr_sec, 0.8, 2.2)
+    sil_n = 1.0 - _normalize(sil_pct, 0.20, 0.50)
     return float(0.35*art_n + 0.35*mlr_n + 0.30*sil_n), {
         "articulation_sps": float(art_rate),
         "mlr_sec": float(mlr_sec),
@@ -269,7 +290,7 @@ def fluency_score(m, transcript, duration_sec, intervals, sr):
     extra, extra_stats = fluency_extra_features(transcript, m, intervals, sr)
     return float(0.6*base + 0.4*extra), tf, extra_stats
 
-# ---- Relevance (semantic) ----
+# -------------------- Relevance --------------------
 def relevance_heuristic(q: str, a: str) -> float:
     qset = set(_content_tokens(q)); aset = set(_content_tokens(a))
     if not qset or not aset: return 0.0
@@ -296,7 +317,7 @@ def relevance_score(question: Optional[str], transcript: Optional[str]) -> float
         return relevance_openai(question, transcript)
     return relevance_heuristic(question, transcript)
 
-# ---- Grammar (heuristic + optional LLM) ----
+# -------------------- Grammar --------------------
 def grammar_analysis(transcript: str) -> Dict[str, int]:
     txt = transcript or ""
     errors = {
@@ -310,26 +331,16 @@ def grammar_analysis(transcript: str) -> Dict[str, int]:
     if not txt.strip():
         return errors
 
-    # repeated words
     errors["repetition"] += len(re.findall(r"\b(\w+)\s+\1\b", txt, flags=re.IGNORECASE))
-
-    # run-on / missing punctuation if long w/out .,?! 
     words = _tokens(txt)
     if len(words) > 40 and not re.search(r"[.!?]", txt): errors["run_on"] += 1
-
-    # simple subject-verb agreement
     errors["sv_agreement"] += len(re.findall(
         r"\b(he|she|it)\s+(go|do|have|want|like|need|think|say|work|live|study|make|take|know|talk|use)\b", txt, flags=re.IGNORECASE))
     errors["aux_mismatch"] += len(re.findall(r"\b(I|you|we|they)\s+was\b", txt, flags=re.IGNORECASE))
     errors["aux_mismatch"] += len(re.findall(r"\b(he|she|it)\s+were\b", txt, flags=re.IGNORECASE))
-
-    # very common irregular past mistakes
     errors["irregular_past"] += len(re.findall(r"\bgoed\b|\bbuyed\b|\brunned\b", txt, flags=re.IGNORECASE))
-
-    # article a/an mismatch (very rough)
     errors["article_mismatch"] += len(re.findall(r"\ba\s+[aeiouAEIOU]\w+", txt))
     errors["article_mismatch"] += len(re.findall(r"\ban\s+[^aeiouAEIOU\W]\w+", txt))
-
     return errors
 
 def grammar_heuristic(transcript: str) -> Tuple[float, Dict[str, int], float]:
@@ -337,9 +348,7 @@ def grammar_heuristic(transcript: str) -> Tuple[float, Dict[str, int], float]:
     n = max(1, len(words))
     errs = grammar_analysis(transcript)
     total_errs = sum(errs.values())
-    # error density per 100 words
     density = (total_errs / n) * 100.0
-    # fewer errors per length => higher score; tune range with pilot data
     score = max(0.0, min(1.0, 1.0 - _normalize(density, 4.0, 18.0)))
     return float(score), errs, float(density)
 
@@ -368,7 +377,7 @@ def grammar_score(transcript: str) -> Tuple[float, Dict[str,int], float]:
     base, errs, density = grammar_heuristic(transcript)
     return (llm if llm is not None else base), errs, density
 
-# ---- Pronunciation proxies ----
+# -------------------- Pronunciation proxies --------------------
 def pronunciation_from_asr_conf(conf: Optional[float]) -> Optional[float]:
     if conf is None: return None
     return float(_normalize(conf, 0.35, 0.92))
@@ -379,7 +388,7 @@ def pronunciation_from_audio(y: np.ndarray, sr: int):
         inv_flat = 1.0 - np.nanmean(flat)
         inv_n = _normalize(inv_flat, 0.05, 0.65)
         f0stats = pitch_stats(y, sr)
-        voiced_proxy = _normalize(f0stats["f0_iqr"], 20, 120)  # more range usually clearer prosody
+        voiced_proxy = _normalize(f0stats["f0_iqr"], 20, 120)
         return float(0.55*voiced_proxy + 0.45*inv_n), f0stats
     except Exception:
         return None, {"f0_med":0.0,"f0_iqr":0.0}
@@ -394,21 +403,18 @@ def pronunciation_score(y: np.ndarray, sr: int, m, asr_conf: Optional[float]):
     elif s_audio is not None:
         s = s_audio
     else:
-        s = float(_normalize(m["voiced_ratio"], 0.25, 0.85))
-    # small nudge with pitch range (helps when ASR conf flatlines)
+        s = float(_normalize(m.get("voiced_ratio",0.0), 0.25, 0.85))
     pron_extra = 0.25 * _normalize(f0stats.get("f0_iqr",0.0), 20, 120)
     s = float(0.9*s + 0.1*pron_extra)
     return s, f0stats
 
-# ---- Vocabulary (variety + sophistication + light POS diversity + bigram variety) ----
+# -------------------- Vocabulary --------------------
 def pos_diversity_heuristic(tokens: List[str]) -> Dict[str, float]:
-    # ultra-light POS guesser (no heavy models): adjectives by common suffixes; adverbs by -ly; verbs by small list/patterns
     if not tokens:
         return {"noun_like":0,"verb_like":0,"adj_like":0,"adv_like":0,"diversity":0.0}
     verbs_common = {"be","is","are","was","were","am","have","has","had","do","did","does","make","go","say","see","get","know","think","take","give","find","tell","work","call","try","ask","need","feel","become","leave","put","keep","let","begin","seem","help","talk","turn","start","show","hear","play","run","move","live","believe","bring","happen","write","provide","sit","stand","lose","pay","meet","include","continue","set","learn","change","lead","watch","follow","stop","create","speak","read","allow","add","spend","grow","open","walk","win","offer","remember","love","consider"}
     adj_suffix = ("ous","ful","able","ible","al","ive","ic","ish","less","y","ary","ory","ant","ent","ate","ed","ing")
     adv_suffix = ("ly",)
-
     noun_like=verb_like=adj_like=adv_like=0
     for w in tokens:
         if len(w)<=2: continue
@@ -416,7 +422,6 @@ def pos_diversity_heuristic(tokens: List[str]) -> Dict[str, float]:
         if w in verbs_common or w=="to": verb_like+=1; continue
         if w.endswith(adj_suffix): adj_like+=1; continue
         noun_like+=1
-
     total = noun_like+verb_like+adj_like+adv_like
     types_used = sum(1 for x in [noun_like,verb_like,adj_like,adv_like] if x>0)
     diversity = types_used/4.0
@@ -431,41 +436,31 @@ def vocabulary_score(transcript: str):
         return 0.0, {"ttr":0.0,"herdan_c":0.0,"adv_ratio":0.0,"pos_diversity":0.0,"bigram_variety":0.0}
     toks = _content_tokens(transcript)
     n = len(toks); v = len(set(toks))
-    # Type-token & Herdan's C (robust at different lengths)
     ttr = (v/n) if n else 0.0
     herdan_c = (math.log(max(1,v))/math.log(max(2,n))) if n>1 else 0.0
-
-    # wordfreq Zipf to estimate advanced vocab ratio
     adv_ratio = 0.0
     try:
         from wordfreq import zipf_frequency
         zs = [zipf_frequency(w, "en") for w in toks]
-        adv = [z for z in zs if z > 0 and z < 3.5]  # lower Zipf = rarer
+        adv = [z for z in zs if z > 0 and z < 3.5]
         adv_ratio = (len(adv)/len(zs)) if zs else 0.0
     except Exception:
         pass
-
-    # POS diversity (lightweight)
     posd = pos_diversity_heuristic(toks)
     pos_div = posd["diversity"]
-
-    # Bigram variety (collocation originality proxy)
     bigrams = list(zip(toks, toks[1:])) if n>1 else []
     uniq_bi = len(set(bigrams))
     bigram_variety = (uniq_bi / max(1,len(bigrams))) if bigrams else 0.0
-
-    # Normalize to 0..1
     ttr_n = _normalize(ttr, 0.30, 0.70)
     herdan_n = _normalize(herdan_c, 0.65, 1.10)
     adv_n = _normalize(adv_ratio, 0.05, 0.30)
     pos_n = _normalize(pos_div, 0.35, 0.85)
     bigram_n = _normalize(bigram_variety, 0.60, 0.90)
-
     score = float(0.35*ttr_n + 0.20*herdan_n + 0.25*adv_n + 0.10*pos_n + 0.10*bigram_n)
     return score, {"ttr":float(ttr), "herdan_c":float(herdan_c), "adv_ratio":float(adv_ratio),
                    "pos_diversity":float(pos_div), "bigram_variety":float(bigram_variety)}
 
-# ---- CEFR mapping & confidence ----
+# -------------------- CEFR mapping & confidence --------------------
 BANDS = ["A1-A2","A2-B1","B1-B2","B2-C1","C1-C2"]
 def band_centers_and_edges():
     edges = [0.0, T_A2, T_B1, T_B2, T_C1, 1.0]
@@ -474,7 +469,6 @@ def band_centers_and_edges():
 
 def band_probabilities(score: float, sigma: float = 0.12) -> Dict[str, float]:
     centers, _ = band_centers_and_edges()
-    # Gaussian kernel around band centers
     exps = [math.exp(-((score - c)**2)/(2*sigma*sigma)) for c in centers]
     s = sum(exps) + 1e-9
     probs = [e/s for e in exps]
@@ -487,53 +481,34 @@ def map_score_to_level(score):
     if score < T_C1:   return "B2-C1 (provisional)"
     return "C1-C2 (provisional)"
 
-# ---- Feedback ----
+# -------------------- Feedback --------------------
 def feedback_from_dims(dim, tf, vstats):
     strengths, areas, tips = [], [], []
-
     if TEEN_TONE:
-        # ---- Teen-friendly wording ----
-        # Fluency
-        if dim["fluency"] >= 0.65:
-            strengths.append("Nice flow — easy to follow. 🙌")
+        if dim["fluency"] >= 0.65: strengths.append("Nice flow — easy to follow. 🙌")
         if dim["fluency"] < 0.45:
             areas.append("Flow got a bit choppy with long pauses.")
             tips.append("Plan your first sentence, then link ideas (because / for example / however).")
         if tf.get("filler_ratio", 0) > 0.08:
             areas.append("Lots of fillers (um/uh/like).")
             tips.append("Quick silent pauses beat fillers — breathe, then continue.")
-
-        # Grammar
-        if dim["grammar"] >= 0.70:
-            strengths.append("Grammar mostly on point. ✅")
+        if dim["grammar"] >= 0.70: strengths.append("Grammar mostly on point. ✅")
         if dim["grammar"] < 0.50:
             areas.append("Some grammar slips (tense/articles/agreement).")
             tips.append("Watch 3rd-person -s and tricky past forms (go→went, buy→bought).")
-
-        # Pronunciation
-        if dim["pronunciation"] >= 0.70:
-            strengths.append("Pronunciation was clear overall.")
+        if dim["pronunciation"] >= 0.70: strengths.append("Pronunciation was clear overall.")
         if dim["pronunciation"] < 0.50:
             areas.append("Sometimes hard to catch words.")
             tips.append("Practice stress & rhythm; record yourself and mimic a model answer.")
-
-        # Vocabulary
-        if dim["vocabulary"] >= 0.65:
-            strengths.append("Good word variety — nice choices.")
+        if dim["vocabulary"] >= 0.65: strengths.append("Good word variety — nice choices.")
         if dim["vocabulary"] < 0.45:
             areas.append("Words repeated a lot.")
             tips.append("Swap repeats for synonyms and add one strong example per idea.")
-
-        # Relevance
-        if dim["relevance"] >= 0.70:
-            strengths.append("You answered the actual question clearly. 🎯")
+        if dim["relevance"] >= 0.70: strengths.append("You answered the actual question clearly. 🎯")
         if dim["relevance"] < 0.50:
             areas.append("Answer drifted off-topic.")
             tips.append("Start by restating the question in your first sentence.")
-
         return {"strengths": strengths[:5], "areas": areas[:6], "tips": tips[:6]}
-
-    # ---- Neutral tone ----
     if dim["fluency"] >= 0.65: strengths.append("Fluency: steady pace with few disruptive pauses.")
     if dim["fluency"] < 0.45:
         areas.append("Fluency: long pauses or choppy delivery reduced flow.")
@@ -541,29 +516,24 @@ def feedback_from_dims(dim, tf, vstats):
     if tf.get("filler_ratio",0) > 0.08:
         areas.append("High filler-word rate (um/uh/like).")
         tips.append("Use short silent pauses instead of fillers and slow down slightly.")
-
     if dim["grammar"] >= 0.70: strengths.append("Grammar: mostly accurate forms for the level.")
     if dim["grammar"] < 0.50:
         areas.append("Grammar: noticeable agreement/tense/article issues.")
         tips.append("Review present simple 3rd-person 's' and past irregulars (go→went, buy→bought).")
-
     if dim["pronunciation"] >= 0.70: strengths.append("Pronunciation: generally clear and intelligible.")
     if dim["pronunciation"] < 0.50:
         areas.append("Pronunciation: clarity/voicing inconsistent.")
         tips.append("Practice minimal pairs and sentence stress; record yourself and mimic native rhythm.")
-
     if dim["vocabulary"] >= 0.65: strengths.append("Vocabulary: good variety and some less frequent words.")
     if dim["vocabulary"] < 0.45:
         areas.append("Vocabulary: limited range / repetition.")
         tips.append("Paraphrase repeated words and add a concrete example per idea.")
     if vstats.get("adv_ratio",0) > 0.30 and dim["grammar"] < 0.55:
         tips.append("Use advanced words only where accurate; prioritize clear grammar and collocations.")
-
     if dim["relevance"] >= 0.70: strengths.append("Relevance: answer addressed the question directly.")
     if dim["relevance"] < 0.50:
         areas.append("Relevance: response drifted from the question.")
         tips.append("Start by restating the question in your first sentence to stay on-topic.")
-
     return {"strengths": strengths[:5], "areas": areas[:6], "tips": tips[:6]}
 
 def llm_feedback(question, transcript, dim) -> Optional[dict]:
@@ -573,12 +543,10 @@ def llm_feedback(question, transcript, dim) -> Optional[dict]:
         from openai import OpenAI
         client = OpenAI()
         if TEEN_TONE:
-            sys = (
-                "You are a friendly CEFR speaking coach for teenagers. "
-                "Give short, encouraging, actionable bullets. Avoid complicated words. "
-                "Focus on: relevance to the question, fluency, grammar, pronunciation, vocabulary. "
-                "Suggest 2–3 concrete tips. Keep it under 120 words. Use a positive, supportive tone."
-            )
+            sys = ("You are a friendly CEFR speaking coach for teenagers. "
+                   "Give short, encouraging, actionable bullets. Avoid complicated words. "
+                   "Focus on: relevance to the question, fluency, grammar, pronunciation, vocabulary. "
+                   "Suggest 2–3 concrete tips. Keep it under 120 words. Positive tone.")
         else:
             sys = "You are a CEFR speaking assessor. Provide concise, actionable feedback in bullets. Avoid praise fluff."
         user = {"question":question, "transcript":transcript, "dimensions":dim}
@@ -599,13 +567,10 @@ class EvalTextIn(BaseModel):
 
 def evaluate_core(tmp_path: Optional[str]=None, raw_bytes: Optional[bytes]=None, question: Optional[str]=None):
     # Load audio if present
-    y = None; sr = 16000
-    intervals = []
+    y = None; sr = 16000; intervals = []
     if tmp_path:
         y, sr = load_audio_to_16k_mono(tmp_path)
         intervals = voice_intervals(y)
-
-    # Activity metrics
     m, intervals = speech_activity_metrics(y if y is not None else np.array([],dtype=np.float32), sr, intervals)
 
     # Transcript + ASR confidence (if audio)
@@ -613,18 +578,14 @@ def evaluate_core(tmp_path: Optional[str]=None, raw_bytes: Optional[bytes]=None,
     if y is not None and tmp_path is not None:
         transcript, asr_provider, asr_conf = get_transcript(y, tmp_path)
 
-    # Fluency (base + extra)
+    # Fluency
     flu, tf, flu_extra = fluency_score(m, transcript, m["duration_sec"], intervals, sr)
-
     # Relevance
     rel = relevance_score(question, transcript) if transcript and question else 0.0
-
     # Grammar
     gra, gram_errs, gram_density = grammar_score(transcript or "")
-
     # Pronunciation
     pro, f0stats = pronunciation_score(y if y is not None else np.array([],dtype=np.float32), sr, m, asr_conf)
-
     # Vocabulary
     voc, vstats = vocabulary_score(transcript or "")
 
@@ -641,7 +602,6 @@ def evaluate_core(tmp_path: Optional[str]=None, raw_bytes: Optional[bytes]=None,
     margin = float(sorted_probs[0][1] - (sorted_probs[1][1] if len(sorted_probs)>1 else 0.0))
     should_stop = bool(top_p >= 0.85 and margin >= 0.15)
 
-    # Feedback
     dim = {"relevance":rel, "fluency":flu, "grammar":gra, "pronunciation":pro, "vocabulary":voc}
     fb = feedback_from_dims(dim, tf, vstats)
     llm_fb = llm_feedback(question, transcript, dim)
@@ -661,8 +621,8 @@ def evaluate_core(tmp_path: Optional[str]=None, raw_bytes: Optional[bytes]=None,
             "segments": m["num_segments"],
             "avg_segment_sec": m["avg_segment_sec"],
             "long_pauses": m["long_pauses"],
-            "fluency_extras": flu_extra,     # articulation_sps, mlr_sec, silence_pct
-            "pitch": f0stats                  # f0_med, f0_iqr
+            "fluency_extras": flu_extra,
+            "pitch": f0stats
         },
         "scores": {
             "overall": overall,
@@ -671,9 +631,9 @@ def evaluate_core(tmp_path: Optional[str]=None, raw_bytes: Optional[bytes]=None,
             "grammar": gra,
             "pronunciation": pro,
             "vocabulary": voc,
-            "wpm": tf.get("wpm",0.0),
-            "lexical_diversity": tf.get("lexical_diversity",0.0),
-            "filler_ratio": tf.get("filler_ratio",0.0),
+            "wpm": (tf.get("wpm",0.0) if isinstance(tf, dict) else 0.0),
+            "lexical_diversity": (tf.get("lexical_diversity",0.0) if isinstance(tf, dict) else 0.0),
+            "filler_ratio": (tf.get("filler_ratio",0.0) if isinstance(tf, dict) else 0.0),
             "vocab_stats": vstats,
             "grammar_errors": gram_errs,
             "grammar_error_density_per100": gram_density
@@ -736,7 +696,8 @@ async def evaluate_bytes(request: Request):
     try:
         data = await request.body()
         if not data: raise HTTPException(status_code=400, detail="Empty request body")
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
+        ext = _guess_ext(request.headers.get("Content-Type"))
+        with tempfile.NamedTemporaryFile(delete=False, suffix=ext) as tmp:
             tmp.write(data); tmp_path = tmp.name
         question = request.headers.get("x-question")
         result = evaluate_core(tmp_path=tmp_path, question=question)
@@ -748,34 +709,23 @@ async def evaluate_bytes(request: Request):
             if 'tmp_path' in locals() and os.path.exists(tmp_path): os.unlink(tmp_path)
         except Exception: pass
 
-# Text-only endpoint for ChatGPT Actions / typed answers
 @app.post("/evaluate-text")
 async def evaluate_text(body: EvalTextIn):
     q = (body.question or "").strip()
     t = (body.transcript or "").strip()
-    # estimate duration if missing
     words = len(_tokens(t)); est_wpm=150.0
     dur = body.duration_sec if (body.duration_sec and body.duration_sec>0) else max(8.0, min(90.0, (words*60.0)/est_wpm))
-    # Build pseudo-metrics to reuse fluency/pron/vocab logic (no audio)
     num_segs = max(1, t.count(".")+t.count("!")+t.count("?"))
     avg_seg_sec = max(0.5, min(3.0, (max(1,words)/num_segs)*60.0/est_wpm))
     m = {"duration_sec": float(dur), "voiced_ratio":0.60, "num_segments": num_segs,
          "avg_segment_sec": avg_seg_sec, "long_pauses": t.count("..."), "silence_pct": 0.40}
-    intervals = []  # no audio; synthesize extras
+    intervals = []
     sr = 16000
-
-    # Fluency
     flu, tf, flu_extra = fluency_score(m, t, m["duration_sec"], intervals, sr)
-    # Relevance
     rel = relevance_score(q, t) if q and t else 0.0
-    # Grammar
     gra, gram_errs, gram_density = grammar_score(t)
-    # Pronunciation (no audio): neutral proxy from voiced_ratio fallback
     pro, f0stats = ( _normalize(m["voiced_ratio"], 0.25, 0.85), {"f0_med":0.0,"f0_iqr":0.0} )
-    # Vocabulary
     voc, vstats = vocabulary_score(t)
-
-    # Overall
     wsum = W_REL + W_FLU + W_GRA + W_PRO + W_VOC
     overall = (W_REL*rel + W_FLU*flu + W_GRA*gra + W_PRO*pro + W_VOC*voc) / (wsum if wsum>0 else 1.0)
     level = map_score_to_level(overall)
@@ -785,7 +735,6 @@ async def evaluate_text(body: EvalTextIn):
     sorted_probs = sorted(band_probs.items(), key=lambda kv: kv[1], reverse=True)
     margin = float(sorted_probs[0][1] - (sorted_probs[1][1] if len(sorted_probs)>1 else 0.0))
     should_stop = bool(top_p >= 0.85 and margin >= 0.15)
-
     dim = {"relevance":rel,"fluency":flu,"grammar":gra,"pronunciation":pro,"vocabulary":voc}
     fb = feedback_from_dims(dim, tf, vstats)
     llm_fb = llm_feedback(q, t, dim)
