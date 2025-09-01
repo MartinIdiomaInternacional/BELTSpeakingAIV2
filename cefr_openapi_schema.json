@@ -1,0 +1,70 @@
+
+{
+  "openapi": "3.0.2",
+  "info": {
+    "title": "CEFR Speaking Evaluator API",
+    "version": "1.2.0",
+    "description": "Upload an audio file; get a CEFR band prediction with score/confidence."
+  },
+  "paths": {
+    "/evaluate-bytes": {
+      "post": {
+        "summary": "Evaluate CEFR from audio bytes",
+        "operationId": "evaluateBytes",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "file": {
+                    "type": "string",
+                    "format": "binary",
+                    "description": "Audio file (wav/mp3/m4a). Max 10 MB."
+                  }
+                },
+                "required": ["file"]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Evaluation successful",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "level": { "type": "string", "example": "B2" },
+                    "score": { "type": "number", "format": "float", "example": 0.67 },
+                    "confidence": { "type": "number", "format": "float", "example": 0.71 },
+                    "duration_sec": { "type": "number", "format": "float", "example": 23.4 },
+                    "sample_rate": { "type": "integer", "example": 16000 },
+                    "warnings": { "type": "array", "items": { "type": "string" } },
+                    "details": { "type": "object" }
+                  },
+                  "required": ["level", "score", "confidence", "duration_sec", "sample_rate"]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request / audio decode error",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+          },
+          "413": {
+            "description": "Payload too large",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+          },
+          "500": {
+            "description": "Server error",
+            "content": { "application/json": { "schema": { "type": "object", "properties": { "error": { "type": "string" } } } } }
+          }
+        }
+      }
+    }
+  },
+  "components": {}
+}
