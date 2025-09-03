@@ -1,0 +1,58 @@
+
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>CEFR Speaking Evaluator</title>
+    <style>
+      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
+      .card { border: 1px solid #ddd; border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
+      .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
+      .btn { padding: 0.6rem 1rem; border: none; border-radius: 10px; cursor: pointer; }
+      .btn-primary { background: #111827; color: white; }
+      .btn-secondary { background: #e5e7eb; }
+      .hidden { display: none; }
+      pre { background: #0b1020; color: #f3f4f6; padding: 1rem; border-radius: 8px; overflow: auto; }
+      .pill { padding: 0.25rem 0.6rem; background: #eef2ff; color: #3730a3; border-radius: 999px; font-weight: 600; }
+      label { font-weight: 600; }
+      select, input[type="file"] { padding: 0.4rem; }
+      footer { margin-top: 2rem; color: #6b7280; font-size: 0.9rem; }
+    </style>
+  </head>
+  <body>
+    <h1>CEFR Speaking Evaluator</h1>
+    <div class="card">
+      <div class="row">
+        <div>
+          <label for="file">Audio file (wav/mp3/m4a)</label><br />
+          <input type="file" id="file" accept="audio/*" />
+        </div>
+        <div>
+          <label for="level">Prompt level</label><br />
+          <select id="level">
+            <option>A1</option><option>A2</option><option>B1</option><option>B1+</option>
+            <option>B2</option><option>B2+</option><option>C1</option><option>C2</option>
+          </select>
+        </div>
+        <button id="btnEval" class="btn btn-primary">Evaluate</button>
+        <button id="btnPrompt" class="btn btn-secondary">Load Prompt</button>
+        <span id="status" class="pill hidden">Working…</span>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Result</h3>
+      <pre id="result">(no response yet)</pre>
+    </div>
+
+    <div class="card">
+      <h3>Prompt</h3>
+      <pre id="prompt">(no prompt loaded)</pre>
+    </div>
+
+    <footer>Tip: if your server uses a different origin, set <code>API_BASE</code> inside <code>main.js</code>.</footer>
+
+    <script src="./static/main.js"></script>
+  </body>
+</html>
