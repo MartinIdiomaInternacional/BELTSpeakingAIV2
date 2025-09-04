@@ -4,7 +4,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>CEFR Speaking Evaluator</title>
+    <title>BELT Speaking Evaluator</title>
     <style>
       body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
       .card { border: 1px solid #ddd; border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
@@ -21,7 +21,7 @@
     </style>
   </head>
   <body>
-    <h1>CEFR Speaking Evaluator</h1>
+    <h1>BELT Speaking Evaluator</h1>
     <div class="card">
       <div class="row">
         <div>
@@ -35,10 +35,16 @@
             <option>B2</option><option>B2+</option><option>C1</option><option>C2</option>
           </select>
         </div>
-        <button id="btnEval" class="btn btn-primary">Evaluate</button>
-        <button id="btnPrompt" class="btn btn-secondary">Load Prompt</button>
+        <button id="btnEval" class="btn btn-primary">Evaluate (single)</button>
+        <button id="btnStart" class="btn btn-secondary">Start Session</button>
+        <button id="btnSubmit" class="btn btn-secondary">Submit Response</button>
         <span id="status" class="pill hidden">Working…</span>
       </div>
+    </div>
+
+    <div class="card">
+      <h3>Prompt</h3>
+      <pre id="prompt">(none)</pre>
     </div>
 
     <div class="card">
@@ -46,13 +52,7 @@
       <pre id="result">(no response yet)</pre>
     </div>
 
-    <div class="card">
-      <h3>Prompt</h3>
-      <pre id="prompt">(no prompt loaded)</pre>
-    </div>
-
-    <footer>Tip: if your server uses a different origin, set <code>API_BASE</code> inside <code>main.js</code>.</footer>
-
+    <footer>Deployed as one service. For separate hosting, edit API_BASE in main.js.</footer>
     <script src="./static/main.js"></script>
   </body>
 </html>

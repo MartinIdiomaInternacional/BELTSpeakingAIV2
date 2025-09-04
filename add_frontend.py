@@ -1,5 +1,4 @@
 
-# add_frontend.py
 from fastapi import APIRouter, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse

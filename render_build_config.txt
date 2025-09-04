@@ -1,29 +1,4 @@
 
-# Render Build Config (Updated 2025-09-01)
-# - Uses Python 3.11
-# - Installs requirements.txt
-# - Launches the FastAPI app with Uvicorn
-#
-# Suggested render.yaml excerpt if you prefer IaC:
-#
-# services:
-# - type: web
-#   name: cefr-evaluator
-#   runtime: python
-#   envVars:
-#     - key: PYTHON_VERSION
-#       value: 3.11.9
-#   buildCommand: pip install -r requirements.txt
-#   startCommand: uvicorn fastapi_cefr_evaluator:app --host 0.0.0.0 --port $PORT
-#
-# Required packages (requirements.txt):
-# fastapi>=0.111
-# uvicorn[standard]>=0.30
-# numpy>=1.26
-# soundfile>=0.12
-# scipy>=1.12
-# audioread>=3.0
-# pydantic>=2.7
-# python-multipart>=0.0.9
-#
-# Optional (for JSON logs to stdout formatting on platform): none required
+# Render: build & start
+# Build: pip install -r requirements.txt
+# Start: uvicorn belt_service:app --host 0.0.0.0 --port $PORT

@@ -8,6 +8,4 @@ audioread>=3.0
 pydantic>=2.7
 python-multipart>=0.0.9
 prometheus-client>=0.20
-# Optional (enable with USE_WAV2VEC=1)
-transformers>=4.41
-torch>=2.2
+openai>=1.35.0
