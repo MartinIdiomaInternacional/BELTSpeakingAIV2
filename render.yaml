@@ -1,0 +1,22 @@
+
+# -------- Render blueprint for Docker deploy --------
+services:
+  - type: web
+    name: beltspeakingai
+    env: docker
+    plan: free    # change to a paid plan if needed
+    dockerfilePath: ./Dockerfile
+    # Auto-detects the port from $PORT env. No start/build cmd needed; Dockerfile defines it.
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false   # set in Render Dashboard
+      - key: ASR_BACKEND
+        value: openai
+      - key: RUBRIC_MODEL
+        value: gpt-4o-mini
+      - key: WHISPER_MODEL
+        value: whisper-1
+      - key: PASS_AVG_THRESHOLD
+        value: "0.70"
+      - key: PASS_MIN_THRESHOLD
+        value: "0.60"

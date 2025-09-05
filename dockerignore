@@ -1,0 +1,28 @@
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.sqlite3
+*.log
+
+# Venvs & builds
+.venv/
+venv/
+env/
+build/
+dist/
+
+# Git
+.git/
+.gitignore
+
+# OS/editor
+.DS_Store
+*.swp
+.idea/
+.vscode/
+
+# Node (if any frontend tooling added later)
+node_modules/
