@@ -4,7 +4,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>BELT Speaking Evaluator</title>
+    <title>BELT Speaking Evaluator — Recorder</title>
     <style>
       body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
       .card { border: 1px solid #ddd; border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
@@ -12,22 +12,21 @@
       .btn { padding: 0.6rem 1rem; border: none; border-radius: 10px; cursor: pointer; }
       .btn-primary { background: #111827; color: white; }
       .btn-secondary { background: #e5e7eb; }
+      .btn-danger { background: #b91c1c; color: white; }
       .hidden { display: none; }
       pre { background: #0b1020; color: #f3f4f6; padding: 1rem; border-radius: 8px; overflow: auto; }
       .pill { padding: 0.25rem 0.6rem; background: #eef2ff; color: #3730a3; border-radius: 999px; font-weight: 600; }
       label { font-weight: 600; }
-      select, input[type="file"] { padding: 0.4rem; }
+      select { padding: 0.4rem; }
       footer { margin-top: 2rem; color: #6b7280; font-size: 0.9rem; }
+      audio { width: 100%; margin-top: 0.5rem; }
     </style>
   </head>
   <body>
-    <h1>BELT Speaking Evaluator</h1>
+    <h1>BELT Speaking Evaluator — Recorder</h1>
+
     <div class="card">
       <div class="row">
-        <div>
-          <label for="file">Audio file (wav/mp3/m4a)</label><br />
-          <input type="file" id="file" accept="audio/*" />
-        </div>
         <div>
           <label for="level">Prompt level</label><br />
           <select id="level">
@@ -35,10 +34,9 @@
             <option>B2</option><option>B2+</option><option>C1</option><option>C2</option>
           </select>
         </div>
-        <button id="btnEval" class="btn btn-primary">Evaluate (single)</button>
-        <button id="btnStart" class="btn btn-secondary">Start Session</button>
-        <button id="btnSubmit" class="btn btn-secondary">Submit Response</button>
-        <span id="status" class="pill hidden">Working…</span>
+        <button id="btnStartSession" class="btn btn-secondary">Start Session</button>
+        <button id="btnLoadPrompt" class="btn btn-secondary">Load Prompt Only</button>
+        <span id="status" class="pill hidden">Idle</span>
       </div>
     </div>
 
@@ -48,11 +46,29 @@
     </div>
 
     <div class="card">
+      <h3>Recorder</h3>
+      <div class="row">
+        <button id="btnRecord" class="btn btn-primary">🎙️ Start Recording</button>
+        <button id="btnStop" class="btn btn-danger" disabled>⏹ Stop</button>
+        <span id="timer" class="pill hidden">00:00</span>
+      </div>
+      <audio id="player" controls class="hidden"></audio>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <button id="btnSubmit" class="btn btn-primary" disabled>Submit Response</button>
+        <button id="btnEvalSingle" class="btn btn-secondary" disabled>Evaluate (single-shot)</button>
+      </div>
       <h3>Result</h3>
       <pre id="result">(no response yet)</pre>
     </div>
 
-    <footer>Deployed as one service. For separate hosting, edit API_BASE in main.js.</footer>
+    <footer>
+      This UI records audio in-browser (WebM/Opus) and sends it to the same backend endpoints.<br/>
+      Tip: if the backend is on a different domain, set <code>API_BASE</code> in <code>main.js</code>.
+    </footer>
+
     <script src="./static/main.js"></script>
   </body>
 </html>
