@@ -374,6 +374,20 @@ async def report(session_id: str):
         for name,val in weak: recs.append(f"Focus on {name} (avg {val:.2f}); targeted tasks to reach next level.")
     return FinalReport(session_id=session_id, final_level=final_level, history=state["history"], recommendations=recs)
 
+# --- Live config endpoint for frontend ---
+@app.get("/config")
+async def config():
+    # Expose runtime config so the UI can fetch thresholds and durations
+    return {
+        "ASR_BACKEND": os.getenv("ASR_BACKEND", "openai"),
+        "RUBRIC_MODEL": os.getenv("RUBRIC_MODEL", "gpt-4o-mini"),
+        "WHISPER_MODEL": os.getenv("WHISPER_MODEL", "whisper-1"),
+        "PASS_AVG_THRESHOLD": os.getenv("PASS_AVG_THRESHOLD", "0.70"),
+        "PASS_MIN_THRESHOLD": os.getenv("PASS_MIN_THRESHOLD", "0.60"),
+        # Optionally control UI recording duration from env
+        "RECORD_SECONDS": int(os.getenv("RECORD_SECONDS", "60"))
+    }
+
 # ---------- Error handlers ----------
 @app.exception_handler(HTTPException)
 async def http_exc_handler(request: Request, exc: HTTPException):
