@@ -1,390 +1,625 @@
-
-"""
-belt_service.py — One-Service BELT Speaking AI
-----------------------------------------------
-- /evaluate-bytes : signal analysis + CEFR level heuristic
-- /start-session, /submit-response, /report/{id} : adaptive progression with ASR+LLM rubric
-- /healthz, /metrics
-- Frontend mounted at / (index.html), /static, /prompts/{level}
-
-Run:
-    uvicorn belt_service:app --host 0.0.0.0 --port 8000
-
-Env:
-    OPENAI_API_KEY=...
-    ASR_BACKEND=openai|none        (default: openai; set none for offline dev)
-    RUBRIC_MODEL=gpt-4o-mini
-    WHISPER_MODEL=whisper-1
-    PASS_AVG_THRESHOLD=0.70
-    PASS_MIN_THRESHOLD=0.60
-"""
-import io
 import os
+import io
 import json
 import time
 import uuid
-from typing import Dict, List, Optional, Tuple
+import random
+import tempfile
+import subprocess
+import urllib.parse
+from pathlib import Path
+from typing import Dict, Optional, List, Set
 
-import numpy as np
-from fastapi import FastAPI, UploadFile, File, HTTPException, Request, Form
-from fastapi.responses import JSONResponse, PlainTextResponse
+from fastapi import FastAPI, HTTPException, Request, Query
+from fastapi import UploadFile, File, Form
+from fastapi.responses import (
+    HTMLResponse, JSONResponse, FileResponse, PlainTextResponse, Response
+)
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from starlette.middleware.base import BaseHTTPMiddleware
 
-# Audio & DSP
-import soundfile as sf
-from scipy.signal import resample_poly
-import audioread
-
-# Metrics
-from prometheus_client import Counter, Histogram, Gauge, generate_latest, CONTENT_TYPE_LATEST
-
-# ---------- Logging ----------
+# ---------- Simple logger ----------
 import logging
-APP_NAME = "belt-service"
-class JsonFormatter(logging.Formatter):
-    def format(self, record):
-        payload = {
-            "ts": int(time.time() * 1000),
-            "level": record.levelname,
-            "name": record.name,
-            "msg": record.getMessage(),
-        }
-        for key in ("request_id","path","method","remote_addr","elapsed_ms"):
-            if hasattr(record, key):
-                payload[key] = getattr(record, key)
-        return json.dumps(payload)
-
-logger = logging.getLogger(APP_NAME)
+logger = logging.getLogger("belt-service")
 handler = logging.StreamHandler()
-handler.setFormatter(JsonFormatter())
+handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s: %(message)s'))
 logger.setLevel(logging.INFO)
 logger.addHandler(handler)
 
-# ---------- App & Metrics ----------
-app = FastAPI(title="BELT Speaking AI (One Service)", version="1.0.0")
-REQ_COUNTER = Counter("belt_requests_total","Total requests",["route","method"])
-REQ_LATENCY = Histogram("belt_request_latency_seconds","Request latency",["route","method"])
-AUDIO_BYTES = Histogram("belt_audio_upload_bytes","Uploaded audio size (bytes)")
-EVAL_SCORE = Histogram("belt_eval_score","Heuristic evaluation score (0..1)")
-READY = Gauge("belt_ready","Readiness (1 ready, 0 not)")
-READY.set(1.0)
+# ---------- Config / env ----------
+ASR_BACKEND = os.getenv("ASR_BACKEND", "openai")
+RUBRIC_MODEL = os.getenv("RUBRIC_MODEL", "gpt-4o-mini")
+WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
 
-class RequestContextMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-        start = time.perf_counter()
-        route = request.url.path
-        method = request.method
-        REQ_COUNTER.labels(route=route, method=method).inc()
-        try:
-            response = await call_next(request)
-            return response
-        finally:
-            elapsed = time.perf_counter() - start
-            REQ_LATENCY.labels(route=route, method=method).observe(elapsed)
-            rec = logging.LogRecord(name=APP_NAME, level=logging.INFO, pathname=__file__, lineno=0,
-                                    msg=f"{method} {route}", args=(), exc_info=None)
-            rec.request_id = request_id
-            rec.path = route
-            rec.method = method
-            rec.remote_addr = request.client.host if request.client else None
-            rec.elapsed_ms = int(elapsed * 1000)
-            logger.handle(rec)
+PASS_AVG_THRESHOLD = float(os.getenv("PASS_AVG_THRESHOLD", "0.70"))
+PASS_MIN_THRESHOLD = float(os.getenv("PASS_MIN_THRESHOLD", "0.60"))
+# If avg is between PASS_AVG_THRESHOLD and (PASS_AVG_THRESHOLD + PROBE_MARGIN),
+# we inject a probe level (e.g., B1 -> B1+, B2 -> B2+) before advancing.
+PROBE_MARGIN = float(os.getenv("PROBE_MARGIN", "0.05"))
 
-app.add_middleware(RequestContextMiddleware)
+RECORD_SECONDS = int(os.getenv("RECORD_SECONDS", "60"))
 
-# ---------- Evaluator utils ----------
-TARGET_SR = 16_000
-MAX_FILE_MB = 10
-MAX_SAMPLES = TARGET_SR * 60 * 5
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
-def _to_mono(x: np.ndarray) -> np.ndarray:
-    return x if x.ndim == 1 else np.mean(x, axis=1)
+# TTS (optional)
+TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.getenv("TTS_VOICE", "alloy")  # alloy, verse, etc.
 
-def _resample(x: np.ndarray, sr: int, target_sr: int) -> np.ndarray:
-    if sr == target_sr:
-        return x
-    from math import gcd
-    g = gcd(sr, target_sr)
-    up = target_sr // g
-    down = sr // g
-    return resample_poly(x, up, down)
+# ---------- LLM/ASR clients (OpenAI style) ----------
+try:
+    from openai import OpenAI
+    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except Exception:
+    logger.warning("OpenAI SDK not available or API key missing; falling back to dummy scoring/TTS.")
+    openai_client = None
 
-def load_audio_safe(file_bytes: bytes, filename: str) -> Tuple[np.ndarray, int]:
-    try:
-        with sf.SoundFile(io.BytesIO(file_bytes)) as f:
-            sr = f.samplerate
-            data = f.read(always_2d=True)
-            x = data.astype(np.float32)
-            x = _to_mono(x)
-    except Exception:
-        try:
-            with audioread.audio_open(io.BytesIO(file_bytes)) as af:
-                sr = af.samplerate
-                pcm = bytearray()
-                for buf in af: pcm.extend(buf)
-                x = np.frombuffer(bytes(pcm), dtype=np.int16).astype(np.float32) / 32768.0
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"Unsupported or corrupted audio file: {filename} ({e})")
-    if x.size == 0:
-        raise HTTPException(status_code=400, detail="Empty audio stream")
-    if x.shape[0] > MAX_SAMPLES * max(1, sr // TARGET_SR):
-        x = x[: MAX_SAMPLES * max(1, sr // TARGET_SR)]
-    x = _resample(x, sr, TARGET_SR).astype(np.float32)
-    x = _to_mono(x)
-    return x, TARGET_SR
+# ---------- App ----------
+app = FastAPI(title="BELT Speaking AI")
 
-def trim_silence(x: np.ndarray, sr: int, frame: int = 400, hop: int = 160, thresh_db: float = -45.0, pad_ms: int = 100):
-    if x.size < frame: return x, 0.0, 0.0
-    n_frames = 1 + (len(x) - frame) // hop
-    E = np.empty(n_frames, dtype=np.float32)
-    for i in range(n_frames):
-        seg = x[i*hop: i*hop + frame]
-        E[i] = 10*np.log10(np.mean(seg**2)+1e-12)
-    mask = E > thresh_db
-    if not np.any(mask): return x, 0.0, 0.0
-    first = int(np.argmax(mask)); last = int(len(mask)-1-np.argmax(mask[::-1]))
-    pad = int((pad_ms/1000.0)*sr)
-    start = max(0, first*hop - pad); end = min(len(x), last*hop + frame + pad)
-    return x[start:end], start/sr, (len(x)-end)/sr
+# CORS (tighten in production if you host frontend separately)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # change to your domain in prod
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def rms_energy(x, frame=400, hop=160):
-    if x.size < frame: return np.array([np.sqrt(np.mean(x**2)+1e-12)], dtype=np.float32)
-    n = 1 + (len(x)-frame)//hop
-    E = np.empty(n, dtype=np.float32)
-    for i in range(n):
-        seg = x[i*hop:i*hop+frame]; E[i]=np.sqrt(np.mean(seg**2)+1e-12)
-    return E
+# ---------- Frontend mounting ----------
+WEB_DIR = Path(__file__).parent / "web"
+STATIC_DIR = WEB_DIR / "static"
+PROMPTS_DIR = WEB_DIR / "prompts"
 
-def zero_crossing_rate(x, frame=400, hop=160):
-    if x.size < frame: return np.array([0.0], dtype=np.float32)
-    n = 1 + (len(x)-frame)//hop
-    Z = np.empty(n, dtype=np.float32)
-    for i in range(n):
-        seg = x[i*hop:i*hop+frame]; Z[i]=(np.mean(np.abs(np.diff(np.sign(seg)))))/2.0
-    return Z
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-def spectral_centroid(x, sr, n_fft=512, hop=160):
-    if x.size < n_fft:
-        X = np.fft.rfft(x, n=n_fft); mag = np.abs(X); freqs=np.fft.rfftfreq(n_fft, d=1.0/sr)
-        return np.array([float(np.sum(freqs*mag)/(np.sum(mag)+1e-12))], dtype=np.float32)
-    frames=[]
-    for start in range(0, len(x)-n_fft+1, hop):
-        seg=x[start:start+n_fft]; X=np.fft.rfft(seg*np.hanning(n_fft)); mag=np.abs(X)
-        freqs=np.fft.rfftfreq(n_fft, d=1.0/sr); frames.append(float(np.sum(freqs*mag)/(np.sum(mag)+1e-12)))
-    return np.array(frames, dtype=np.float32)
+# Root serves index.html
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    idx = WEB_DIR / "index.html"
+    if not idx.exists():
+        return HTMLResponse("<h1>BELT Speaking AI</h1><p>Frontend missing. Place web/index.html here.</p>", status_code=200)
+    return HTMLResponse(idx.read_text(encoding="utf-8"))
 
-def heuristic_evaluate(x: np.ndarray, sr: int):
-    warnings=[]
-    dur=len(x)/sr
-    if dur<3.0: warnings.append("Very short duration (<3s) may reduce reliability.")
-    if dur>120.0: warnings.append("Long duration; truncated to 5 minutes.")
-    E=rms_energy(x); Z=zero_crossing_rate(x); C=spectral_centroid(x,sr)
-    speech_frames=(E>(E.mean()*0.5)).sum(); vad_ratio=speech_frames/max(1,len(E))
-    zcr_var=float(np.var(Z)); cent_var=float(np.var(C)); energy_mean=float(np.mean(E))
-    vad_score=float(np.clip((vad_ratio-0.2)/0.7,0,1))
-    zcr_score=float(np.clip(1.0-np.tanh(3*zcr_var),0,1))
-    cent_score=float(np.clip(1.0-np.tanh(1e-4*cent_var),0,1))
-    loud_score=float(np.clip(np.log1p(energy_mean*1000.0),0,1))
-    raw=0.35*vad_score+0.25*zcr_score+0.25*cent_score+0.15*loud_score
-    conf=float(np.clip(0.4+0.3*vad_score+0.2*(1-abs(zcr_var-0.02))+0.1*np.clip(dur/30.0,0,1),0,1))
-    details={"duration_sec":dur,"features":{"vad_ratio":vad_ratio,"zcr_var":zcr_var,"centroid_var":cent_var,"energy_mean":energy_mean,
-             "scores":{"vad":vad_score,"zcr_stability":zcr_score,"centroid_stability":cent_score,"loudness":loud_score}}}
-    return float(np.clip(raw,0,1)), details, warnings
-
-def map_score_to_cefr(score: float) -> str:
-    if score<0.20: return "A1"
-    if score<0.30: return "A2"
-    if score<0.45: return "B1"
-    if score<0.55: return "B1+"
-    if score<0.68: return "B2"
-    if score<0.78: return "B2+"
-    if score<0.88: return "C1"
-    return "C2"
-
-class EvalResponse(BaseModel):
-    level: str
-    score: float = Field(..., ge=0, le=1)
-    confidence: float = Field(..., ge=0, le=1)
-    duration_sec: float = Field(..., ge=0)
-    sample_rate: int = Field(..., ge=8000)
-    warnings: List[str] = Field(default_factory=list)
-    details: Dict = Field(default_factory=dict)
-
-# ---------- Health & Metrics ----------
-@app.get("/healthz", response_class=PlainTextResponse)
-async def healthz(): return "ok"
-
-@app.get("/readyz", response_class=PlainTextResponse)
-async def readyz(): return "ready" if READY._value.get()==1.0 else "not-ready"
+# ---------- Health / metrics ----------
+@app.get("/healthz")
+async def healthz():
+    return PlainTextResponse("ok")
 
 @app.get("/metrics")
-async def metrics(): return PlainTextResponse(generate_latest(), media_type=CONTENT_TYPE_LATEST)
+async def metrics():
+    lines = [
+        "# HELP belt_requests_total Total requests.",
+        "# TYPE belt_requests_total counter",
+        'belt_requests_total{endpoint="/"} 1'
+    ]
+    return PlainTextResponse("\n".join(lines))
 
-# ---------- /evaluate-bytes ----------
-@app.post("/evaluate-bytes", response_model=EvalResponse)
-async def evaluate_bytes(request: Request, file: UploadFile = File(...)):
-    request_id = request.headers.get("X-Request-ID", str(uuid.uuid4()))
-    if not file or not file.filename: raise HTTPException(status_code=400, detail="No file uploaded")
-    content = await file.read()
-    AUDIO_BYTES.observe(len(content))
-    size_mb = len(content)/(1024*1024)
-    if size_mb>MAX_FILE_MB: raise HTTPException(status_code=413, detail=f"File too large ({size_mb:.2f} MB). Limit {MAX_FILE_MB} MB.")
-    try:
-        x, sr = load_audio_safe(content, file.filename)
-    except HTTPException: raise
-    except Exception as e: raise HTTPException(status_code=400, detail=f"Unable to decode audio: {e}")
-    x_trim, lead, trail = trim_silence(x, sr)
-    score, details, warnings = heuristic_evaluate(x_trim, sr)
-    level = map_score_to_cefr(score)
-    EVAL_SCORE.observe(score)
-    rec = logging.LogRecord(name=APP_NAME, level=logging.INFO, pathname=__file__, lineno=0,
-                            msg=f"evaluated {file.filename} -> {level} ({score:.3f})", args=(), exc_info=None)
-    rec.request_id = request_id; logger.handle(rec)
-    details.update({"trim_leading_sec":lead,"trim_trailing_sec":trail})
-    return EvalResponse(level=level, score=score,
-                        confidence=float(np.clip(details["features"]["scores"]["vad"]*0.5 + score*0.5, 0, 1)),
-                        duration_sec=float(details["duration_sec"]), sample_rate=sr,
-                        warnings=warnings, details=details)
+# ---------- Live config for UI ----------
+@app.get("/config")
+async def config():
+    return {
+        "ASR_BACKEND": ASR_BACKEND,
+        "RUBRIC_MODEL": RUBRIC_MODEL,
+        "WHISPER_MODEL": WHISPER_MODEL,
+        "PASS_AVG_THRESHOLD": str(PASS_AVG_THRESHOLD),
+        "PASS_MIN_THRESHOLD": str(PASS_MIN_THRESHOLD),
+        "PROBE_MARGIN": str(PROBE_MARGIN),
+        "RECORD_SECONDS": RECORD_SECONDS,
+        "TTS_MODEL": TTS_MODEL,
+        "TTS_VOICE": TTS_VOICE,
+    }
 
-# ---------- Adaptive Session Manager (ASR + LLM) ----------
-CEFR_ORDER = ["A1","A2","B1","B1+","B2","B2+","C1","C2"]
-PASS_AVG_THRESHOLD = float(os.getenv("PASS_AVG_THRESHOLD","0.70"))
-PASS_MIN_THRESHOLD = float(os.getenv("PASS_MIN_THRESHOLD","0.60"))
-ASR_BACKEND = os.getenv("ASR_BACKEND","openai").lower()
-RUBRIC_MODEL = os.getenv("RUBRIC_MODEL","gpt-4o-mini")
-WHISPER_MODEL = os.getenv("WHISPER_MODEL","whisper-1")
-PROMPTS = {
-    "A1":"Introduce yourself: your name, job/studies, and one hobby.",
-    "A2":"Describe a recent weekend or holiday you enjoyed. What did you do?",
-    "B1":"Discuss advantages and disadvantages of remote work.",
-    "B1+":"Talk about a challenge at work/study and how you solved it.",
-    "B2":"Compare two approaches to team communication and argue for one.",
-    "B2+":"Explain a complex process from your field to a newcomer.",
-    "C1":"Evaluate the impact of AI on your industry, including risks and benefits.",
-    "C2":"Present a nuanced argument on a controversial topic with counterarguments.",
-}
-class StartSessionResponse(BaseModel):
-    session_id: str; level: str; prompt: str
-class SubmitResponse(BaseModel):
-    session_id: str; level: str; scores: Dict[str,float]; decision: str
-    next_level: Optional[str]=None; next_prompt: Optional[str]=None
-    transcript: Optional[str]=None; signal: Dict = Field(default_factory=dict)
+# ---------- Session models / state ----------
+CEFR_ORDER: List[str] = ["A1", "A2", "B1", "B1+", "B2", "B2+", "C1", "C2"]
+
+class ScoreDict(BaseModel):
+    fluency: float = 0.0
+    grammar: float = 0.0
+    vocabulary: float = 0.0
+    pronunciation: float = 0.0
+    coherence: float = 0.0
+
+class Turn(BaseModel):
+    level: str
+    question: str
+    transcript: str
+    scores: ScoreDict
+    average: float
+    decision: str  # "advance" or "stop"
+    attempt: int   # 1 or 2 at that level
+
 class FinalReport(BaseModel):
-    session_id: str; final_level: str; history: List[Dict]; recommendations: List[str]=Field(default_factory=list)
+    session_id: str
+    final_level: str
+    history: List[Turn]
+    recommendations: List[str] = Field(default_factory=list)
+
+# SESSIONS holds per-session state, including used question indices per level and current question/attempt
+# SESSIONS[session_id] = {
+#   "current_level": "A1",
+#   "current_question": "....",
+#   "current_attempt": 1,
+#   "history": [Turn, ...],
+#   "final_level": Optional[str],
+#   "used_questions": { "A1": set(int,...), "A2": set(...) }
+# }
 SESSIONS: Dict[str, Dict] = {}
 
-def _next_level(level: str) -> Optional[str]:
-    if level not in CEFR_ORDER: return None
-    i = CEFR_ORDER.index(level); return CEFR_ORDER[i+1] if i+1 < len(CEFR_ORDER) else None
-def _pass_fail(scores: Dict[str,float]) -> bool:
-    vals=[v for v in scores.values() if isinstance(v,(int,float))]
-    return bool(vals) and (np.mean(vals)>=PASS_AVG_THRESHOLD) and (min(vals)>=PASS_MIN_THRESHOLD)
+# Mapping for probe levels (insert a probe level if borderline pass)
+PROBE_MAP: Dict[str, str] = {
+    "A2": "B1",
+    "B1": "B1+",
+    "B2": "B2+",
+    # optional: "C1": "C1" (no probe beyond C2)
+}
 
-def asr_transcribe_openai(bytes_data: bytes, filename: str) -> str:
+# ---------- Guided prompt loading / selection ----------
+def _load_questions_for_level(level: str) -> List[str]:
+    """
+    Reads web/prompts/<LEVEL>.json.
+    If it contains "questions": [...], return that list.
+    Else, if it contains single "instructions": "...", return [that].
+    Else, return a generic fallback.
+    """
+    p = PROMPTS_DIR / f"{level}.json"
+    if not p.exists():
+        return [f"Speak for ~60 seconds about a topic suitable for {level}."]
     try:
-        from openai import OpenAI
-        client = OpenAI()
-        resp = client.audio.transcriptions.create(
-            model=WHISPER_MODEL, file=(filename, io.BytesIO(bytes_data), "application/octet-stream")
-        )
-        return getattr(resp,"text","") or ""
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OpenAI ASR failed: {e}")
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return [f"Speak for ~60 seconds about a topic suitable for {level}."]
 
-def transcribe_audio(x: np.ndarray, sr: int, raw_bytes: bytes, filename: str) -> str:
-    if ASR_BACKEND=="none": return "[TRANSCRIPT_PLACEHOLDER]"
-    return asr_transcribe_openai(raw_bytes, filename)
+    if isinstance(data, dict):
+        if isinstance(data.get("questions"), list) and data["questions"]:
+            return [str(q) for q in data["questions"] if isinstance(q, str) and q.strip()]
+        instr = data.get("instructions")
+        if isinstance(instr, str) and instr.strip():
+            return [instr.strip()]
+    return [f"Speak for ~60 seconds about a topic suitable for {level}."]
 
-RUBRIC_SYS_PROMPT = """
-You are a strict CEFR speaking examiner. Score the candidate's response (transcript provided)
-on these five categories, output JSON ONLY with floats 0..1:
-{"grammar":0.0,"vocabulary":0.0,"pronunciation":0.0,"fluency":0.0,"coherence":0.0}
-Anchor points: 0.20≈A1, 0.30≈A2, 0.45≈B1, 0.55≈B1+, 0.68≈B2, 0.78≈B2+, 0.88≈C1, 0.95+≈C2
+def _choose_question_index(level: str, used: Set[int]) -> int:
+    """
+    Choose a question index not in 'used' if possible.
+    If all are used, reset (allow repeats) and choose again.
+    """
+    qs = _load_questions_for_level(level)
+    n = len(qs)
+    if n == 0:
+        return 0
+    candidates = [i for i in range(n) if i not in used]
+    if not candidates:
+        used.clear()
+        candidates = list(range(n))
+    return random.choice(candidates)
+
+def _get_question_for_session(level: str, session_id: Optional[str]) -> str:
+    """
+    If session_id provided and valid, track used indices per level to avoid repeats.
+    Otherwise return a random question without tracking.
+    """
+    questions = _load_questions_for_level(level)
+    if not questions:
+        return f"Speak for ~60 seconds about a topic suitable for {level}."
+
+    if session_id and session_id in SESSIONS:
+        sess = SESSIONS[session_id]
+        used_map = sess.setdefault("used_questions", {})
+        used_set: Set[int] = used_map.setdefault(level, set())
+        idx = _choose_question_index(level, used_set)
+        used_set.add(idx)
+        return questions[idx]
+
+    return random.choice(questions)
+
+def _next_level(current: str) -> Optional[str]:
+    if current not in CEFR_ORDER:
+        return None
+    idx = CEFR_ORDER.index(current)
+    if idx + 1 < len(CEFR_ORDER):
+        return CEFR_ORDER[idx + 1]
+    return None
+
+# ---------- Audio helpers (robust upload handling) ----------
+def _save_upload_to_temp(upload: UploadFile) -> str:
+    """Persist UploadFile to a real temp file and return its path."""
+    suffix = ""
+    if upload.filename and "." in upload.filename:
+        suffix = "." + upload.filename.split(".")[-1].lower()
+    fd, tmp_path = tempfile.mkstemp(suffix=suffix)
+    os.close(fd)
+    upload.file.seek(0)
+    with open(tmp_path, "wb") as f:
+        f.write(upload.file.read())
+    upload.file.seek(0)
+    return tmp_path
+
+def _ffmpeg_convert_to_wav16k_mono(src_path: str) -> str:
+    """Use ffmpeg to convert any audio (webm/ogg/m4a/mp3/wav) to 16k mono WAV."""
+    out_path = src_path + ".__conv.wav"
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src_path,
+        "-ac", "1",
+        "-ar", "16000",
+        out_path
+    ]
+    try:
+        subprocess.run(cmd, check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    except subprocess.CalledProcessError as e:
+        err = e.stderr.decode("utf-8", errors="ignore")
+        raise RuntimeError(f"ffmpeg failed: {err[:500]}")
+    return out_path
+
+def _infer_should_convert(content_type: Optional[str], filename: Optional[str]) -> bool:
+    """Return True if we should run ffmpeg conversion (most types except raw WAV)."""
+    ct = (content_type or "").lower()
+    name = (filename or "").lower()
+    if "audio/wav" in ct or name.endswith(".wav"):
+        return False
+    return True
+
+# ---------- Simple rubric prompt ----------
+RUBRIC_SYSTEM = """You are a CEFR speaking examiner. Score the response 0.0–1.0 in five categories:
+- fluency
+- grammar
+- vocabulary
+- pronunciation
+- coherence
+Return strict JSON: {"fluency": float, "grammar": float, "vocabulary": float, "pronunciation": float, "coherence": float, "feedback": string}.
 """
-def rubric_score_llm(transcript: str) -> Dict[str,float]:
+
+def _llm_score_transcript(transcript: str, level: str) -> Dict:
+    """
+    Calls an LLM to score the transcript per CEFR dimensions.
+    Returns dict: {"fluency":..., ..., "feedback": "..."}
+    """
+    if not openai_client:
+        # Fallback heuristic if no API key
+        length = len(transcript.split())
+        base = min(1.0, max(0.1, length / 120))
+        return {
+            "fluency": round(base, 2),
+            "grammar": round(base * 0.95, 2),
+            "vocabulary": round(base * 0.90, 2),
+            "pronunciation": round(0.75, 2),
+            "coherence": round(base * 0.92, 2),
+            "feedback": "Heuristic offline scoring (no API key)."
+        }
+
+    user_prompt = f"Level: {level}\nTranscript:\n{transcript}\n"
+    resp = openai_client.chat.completions.create(
+        model=RUBRIC_MODEL,
+        messages=[
+            {"role": "system", "content": RUBRIC_SYSTEM},
+            {"role": "user", "content": user_prompt}
+        ],
+        temperature=0.2,
+        response_format={"type": "json_object"},
+    )
     try:
-        from openai import OpenAI
-        client = OpenAI()
-        resp = client.chat.completions.create(
-            model=RUBRIC_MODEL,
-            messages=[{"role":"system","content":RUBRIC_SYS_PROMPT},
-                      {"role":"user","content":f"Transcript:\n{transcript}\nReturn JSON only."}],
-            response_format={"type":"json_object"}, temperature=0.2,
+        data = json.loads(resp.choices[0].message.content)
+        return data
+    except Exception:
+        logger.exception("Failed to parse rubric model JSON; falling back to heuristic.")
+        length = len(transcript.split())
+        base = min(1.0, max(0.1, length / 120))
+        return {
+            "fluency": round(base, 2),
+            "grammar": round(base * 0.95, 2),
+            "vocabulary": round(base * 0.90, 2),
+            "pronunciation": round(0.75, 2),
+            "coherence": round(base * 0.92, 2),
+            "feedback": "Heuristic fallback due to parse error."
+        }
+
+def _decide(scores: ScoreDict) -> bool:
+    """
+    Returns True if pass (advance), False if stop.
+    Rule: avg >= PASS_AVG_THRESHOLD AND all >= PASS_MIN_THRESHOLD.
+    """
+    vals = [scores.fluency, scores.grammar, scores.vocabulary, scores.pronunciation, scores.coherence]
+    avg = sum(vals) / len(vals)
+    return (avg >= PASS_AVG_THRESHOLD) and all(v >= PASS_MIN_THRESHOLD for v in vals)
+
+def _borderline_pass(scores: ScoreDict) -> bool:
+    """
+    A 'borderline pass' is when the average is >= PASS_AVG_THRESHOLD but < PASS_AVG_THRESHOLD + PROBE_MARGIN,
+    OR any category is within PROBE_MARGIN of PASS_MIN_THRESHOLD.
+    """
+    vals = [scores.fluency, scores.grammar, scores.vocabulary, scores.pronunciation, scores.coherence]
+    avg = sum(vals) / len(vals)
+    near_min = any((v - PASS_MIN_THRESHOLD) < PROBE_MARGIN for v in vals)
+    return (avg >= PASS_AVG_THRESHOLD and avg < PASS_AVG_THRESHOLD + PROBE_MARGIN) or near_min
+
+def _load_prompt(level: str, session_id: Optional[str] = None) -> str:
+    """Return a guided question, session-aware if session_id present."""
+    return _get_question_for_session(level, session_id)
+
+# ---------- Core pipeline ----------
+async def _asr_transcribe_file(wav_file_path: str) -> str:
+    """
+    Transcribe a WAV file (16k mono) to text using OpenAI Whisper if enabled,
+    otherwise return a dummy placeholder.
+    """
+    if ASR_BACKEND.lower() != "openai" or not openai_client:
+        return "(no-ASR) Placeholder transcript for testing."
+
+    with open(wav_file_path, "rb") as f:
+        trans = openai_client.audio.transcriptions.create(
+            model=WHISPER_MODEL,
+            file=f,
+            response_format="text"
         )
-        data=json.loads(resp.choices[0].message.content)
-        out={}
-        for k in ["grammar","vocabulary","pronunciation","fluency","coherence"]:
-            v=float(data.get(k,0)); out[k]=float(max(0.0,min(1.0,v)))
-        return out
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"LLM rubric scoring failed: {e}")
+    return trans if isinstance(trans, str) else str(trans)
 
-@app.post("/start-session", response_model=StartSessionResponse)
-async def start_session(level: str = Form("A1")):
-    if level not in CEFR_ORDER: raise HTTPException(status_code=400, detail="Invalid start level")
-    sid=str(uuid.uuid4())
-    SESSIONS[sid]={"session_id":sid,"current_level":level,"history":[],"final_level":None,"started_at":int(time.time())}
-    return StartSessionResponse(session_id=sid, level=level, prompt=PROMPTS[level])
+async def transcribe_and_score(session_id: str, wav_file_path: str) -> Dict:
+    """
+    End-to-end: ASR -> LLM scoring -> adaptive decision & next prompt.
+    Updates SESSIONS[session_id]["history"] and returns a response dict for the UI.
+    """
+    state = SESSIONS.get(session_id)
+    if not state:
+        raise HTTPException(status_code=404, detail="Session not found")
+    level = state["current_level"]
+    question = state.get("current_question", f"(question unavailable for {level})")
+    attempt = int(state.get("current_attempt", 1))
 
-@app.post("/submit-response", response_model=SubmitResponse)
-async def submit_response(session_id: str = Form(...), file: UploadFile = File(...)):
-    if session_id not in SESSIONS: raise HTTPException(status_code=404, detail="Session not found")
-    state=SESSIONS[session_id]; level=state["current_level"]
-    raw=await file.read()
-    try:
-        x, sr = load_audio_safe(raw, file.filename)
-        x_trim, lead_s, trail_s = trim_silence(x, sr)
-        sig_score, sig_details, sig_warn = heuristic_evaluate(x_trim, sr)
-        signal={"duration_sec":sig_details.get("duration_sec", len(x_trim)/sr),
-                "features":sig_details.get("features",{}),"warnings":sig_warn,
-                "overall_signal_score":sig_score}
-    except HTTPException as e:
-        raise e
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Audio processing failed: {e}")
-    transcript = transcribe_audio(x_trim, sr, raw, file.filename)
-    scores = rubric_score_llm(transcript)
-    scores["fluency"]=float(0.7*scores["fluency"] + 0.3*min(1.0,max(0.0,sig_score)))
-    scores["pronunciation"]=float(0.7*scores["pronunciation"] + 0.3*min(1.0,max(0.0,sig_score)))
-    decision = "advance" if _pass_fail(scores) else "stop"
-    next_level = _next_level(level) if decision=="advance" else None
-    next_prompt = PROMPTS[next_level] if next_level else None
-    state["history"].append({"level":level,"scores":scores,"decision":decision,"transcript":transcript})
-    if decision=="advance" and next_level:
-        state["current_level"]=next_level
+    # 1) ASR
+    transcript = await _asr_transcribe_file(wav_file_path)
+
+    # 2) Score via LLM
+    raw = _llm_score_transcript(transcript, level)
+    scores = ScoreDict(
+        fluency=float(raw.get("fluency", 0.0)),
+        grammar=float(raw.get("grammar", 0.0)),
+        vocabulary=float(raw.get("vocabulary", 0.0)),
+        pronunciation=float(raw.get("pronunciation", 0.0)),
+        coherence=float(raw.get("coherence", 0.0)),
+    )
+    avg = (scores.fluency + scores.grammar + scores.vocabulary + scores.pronunciation + scores.coherence) / 5.0
+    passed = _decide(scores)
+    borderline = _borderline_pass(scores) if passed else False
+
+    decision = "advance" if passed else "stop"
+    result: Dict = {
+        "session_id": session_id,
+        "level": level,
+        "question": question,
+        "transcript": transcript,
+        "scores": scores.model_dump(),
+        "average": round(avg, 4),
+        "decision": decision,
+        "attempt": attempt,
+        "borderline": borderline,
+    }
+
+    # 3) Update session history (store question & attempt)
+    state["history"].append(Turn(level=level, question=question, transcript=transcript,
+                                 scores=scores, average=avg, decision=decision, attempt=attempt))
+
+    if passed:
+        # Decide if we should insert a probe level
+        next_lvl = _next_level(level)
+        if borderline and level in PROBE_MAP:
+            probe = PROBE_MAP[level]
+            # Only insert probe if it's not the same as current and exists in our CEFR list
+            if probe in CEFR_ORDER and probe != level:
+                next_lvl = probe
+
+        if next_lvl:
+            state["current_level"] = next_lvl
+            state["current_attempt"] = 1  # reset attempt counter for new level
+            next_q = _load_prompt(next_lvl, session_id=session_id)
+            state["current_question"] = next_q
+            result["next_level"] = next_lvl
+            result["next_prompt"] = next_q
+        else:
+            # already at top level; stop
+            state["final_level"] = level
+            result["decision"] = "stop"
     else:
-        state["final_level"]=CEFR_ORDER[max(0, CEFR_ORDER.index(level)-1)] if decision=="stop" else level
-    return SubmitResponse(session_id=session_id, level=level, scores=scores, decision=decision,
-                          next_level=next_level, next_prompt=next_prompt, transcript=transcript, signal=signal)
+        # stop at current level
+        state["final_level"] = state.get("final_level") or level
+
+    return result
+
+# ---------- API: start-session / prompts / submit-response / evaluate-bytes / report ----------
+
+@app.post("/start-session")
+async def start_session(level: str = Form("A1")):
+    if level not in CEFR_ORDER:
+        level = "A1"
+    session_id = str(uuid.uuid4())
+    first_q = _load_prompt(level, session_id=session_id)
+    SESSIONS[session_id] = {
+        "current_level": level,
+        "current_question": first_q,
+        "current_attempt": 1,
+        "history": [],
+        # populated when stop
+        # "final_level": str
+        # used question indices per level:
+        "used_questions": {}
+    }
+    logger.info("start-session", extra={"session_id": session_id, "level": level})
+    # Provide optional TTS URL for the UI to play the examiner voice
+    tts_url = f"/tts?text={urllib.parse.quote_plus(first_q)}"
+    return {
+        "session_id": session_id,
+        "level": level,
+        "prompt": first_q,
+        "prompt_tts_url": tts_url
+    }
+
+# Prompts by level (returns ONE guided question).
+# If session_id is provided (?session_id=UUID), it avoids repeats for that session and updates the session's current_question.
+@app.get("/prompts/{level}")
+async def prompt_level(level: str, session_id: Optional[str] = Query(default=None)):
+    if level not in CEFR_ORDER:
+        raise HTTPException(status_code=404, detail=f"Unknown level: {level}")
+    q = _load_prompt(level, session_id=session_id)
+    # If session present, update the session's current question and reset attempt to 1 for retries/next-turns if needed.
+    if session_id and session_id in SESSIONS:
+        SESSIONS[session_id]["current_question"] = q
+        # When fetching a new question at the same level (retry), set attempt=2.
+        # The UI triggers this after a fail, so we set attempt=2, but only if level == current_level.
+        if SESSIONS[session_id].get("current_level") == level:
+            SESSIONS[session_id]["current_attempt"] = 2
+    return JSONResponse({
+        "level": level,
+        "instructions": q,
+        "prompt_tts_url": f"/tts?text={urllib.parse.quote_plus(q)}"
+    })
+
+@app.post("/submit-response")
+async def submit_response(
+    # Accept multiple possible field names; the first non-None will be used.
+    file: Optional[UploadFile] = File(default=None),
+    audio: Optional[UploadFile] = File(default=None),
+    audio_file: Optional[UploadFile] = File(default=None),
+    session_id: str = Form(...),
+):
+    """
+    Accepts recorded audio from the UI and advances/stops adaptively.
+    Robust to audio/webm (MediaRecorder), ogg, mp3, m4a, wav (ffmpeg conversion to 16k mono WAV).
+    """
+    try:
+        if session_id not in SESSIONS:
+            raise HTTPException(status_code=404, detail="Session not found")
+
+        upload = file or audio or audio_file
+        if upload is None:
+            raise HTTPException(status_code=400, detail="No audio file received. Expected 'file' (or 'audio'/'audio_file').")
+
+        src_path = _save_upload_to_temp(upload)
+        needs_conv = _infer_should_convert(upload.content_type, upload.filename)
+        wav_path = src_path if not needs_conv else _ffmpeg_convert_to_wav16k_mono(src_path)
+
+        try:
+            result = await transcribe_and_score(session_id=session_id, wav_file_path=wav_path)
+        finally:
+            try:
+                if os.path.exists(src_path):
+                    os.remove(src_path)
+            except Exception:
+                pass
+            try:
+                if needs_conv and os.path.exists(wav_path):
+                    os.remove(wav_path)
+            except Exception:
+                pass
+
+        return JSONResponse(result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("submit-response failed", extra={
+            "error": str(e),
+            "content_type": getattr(upload, "content_type", None) if 'upload' in locals() and upload else None,
+            "filename": getattr(upload, "filename", None) if 'upload' in locals() and upload else None
+        })
+        raise HTTPException(status_code=400, detail=f"submit-response error: {str(e)[:400]}")
+
+@app.post("/evaluate-bytes")
+async def evaluate_bytes(file: UploadFile = File(...)):
+    """
+    Single-shot evaluation (not adaptive). Returns scores/avg for a one-off clip.
+    """
+    try:
+        session_id = str(uuid.uuid4())
+        SESSIONS[session_id] = {
+            "current_level": "A1", "current_question": "(single-shot)", "current_attempt": 1,
+            "history": [], "used_questions": {}
+        }
+        src_path = _save_upload_to_temp(file)
+        needs_conv = _infer_should_convert(file.content_type, file.filename)
+        wav_path = src_path if not needs_conv else _ffmpeg_convert_to_wav16k_mono(src_path)
+        try:
+            out = await transcribe_and_score(session_id=session_id, wav_file_path=wav_path)
+            out.pop("next_level", None)
+            out.pop("next_prompt", None)
+            return JSONResponse(out)
+        finally:
+            try:
+                if os.path.exists(src_path):
+                    os.remove(src_path)
+            except Exception:
+                pass
+            try:
+                if needs_conv and os.path.exists(wav_path):
+                    os.remove(wav_path)
+            except Exception:
+                pass
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"evaluate-bytes error: {str(e)[:400]}")
 
 @app.get("/report/{session_id}", response_model=FinalReport)
 async def report(session_id: str):
-    if session_id not in SESSIONS: raise HTTPException(status_code=404, detail="Session not found")
-    state=SESSIONS[session_id]; final_level=state.get("final_level") or state["current_level"]
-    cat_sums={"fluency":0,"grammar":0,"vocabulary":0,"pronunciation":0,"coherence":0}; n=0
-    for step in state["history"]:
-        for k in cat_sums: cat_sums[k]+=step["scores"].get(k,0)
-        n+=1
-    recs=[]
-    if n>0:
-        avgs={k:(v/n) for k,v in cat_sums.items()}
-        weak=sorted(avgs.items(), key=lambda x: x[1])[:2]
-        for name,val in weak: recs.append(f"Focus on {name} (avg {val:.2f}); targeted tasks to reach next level.")
+    if session_id not in SESSIONS:
+        raise HTTPException(status_code=404, detail="Session not found")
+    state = SESSIONS[session_id]
+    final_level = state.get("final_level") or state["current_level"]
+
+    # Simple recs based on last turn’s lowest category
+    recs: List[str] = []
+    if state["history"]:
+        last: Turn = state["history"][-1]
+        lows = sorted(
+            [("fluency", last.scores.fluency),
+             ("grammar", last.scores.grammar),
+             ("vocabulary", last.scores.vocabulary),
+             ("pronunciation", last.scores.pronunciation),
+             ("coherence", last.scores.coherence)],
+            key=lambda x: x[1]
+        )
+        focus = ", ".join([k for k, _ in lows[:2]])
+        recs.append(f"Focus more on: {focus}.")
+
     return FinalReport(session_id=session_id, final_level=final_level, history=state["history"], recommendations=recs)
 
-# ---------- Error handlers ----------
-@app.exception_handler(HTTPException)
-async def http_exc_handler(request: Request, exc: HTTPException):
-    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
-@app.exception_handler(Exception)
-async def generic_exc_handler(request: Request, exc: Exception):
-    return JSONResponse(status_code=500, content={"error": "Internal server error"})
+# ---------- TTS (examiner voice) ----------
+# GET /tts?text=...  or POST {"text": "..."} -> returns audio/mpeg
+@app.get("/tts")
+async def tts_get(text: str = Query(..., description="Text to synthesize")):
+    return await _tts_core(text)
 
-# ---------- Attach frontend ----------
-try:
-    from add_frontend import attach_frontend
-    attach_frontend(app, web_dir="web")
-except Exception as e:
-    logger.info(f"Frontend attach skipped: {e}")
+@app.post("/tts")
+async def tts_post(payload: Dict):
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if not text or not isinstance(text, str):
+        raise HTTPException(status_code=400, detail="Missing 'text' in body.")
+    return await _tts_core(text)
+
+async def _tts_core(text: str):
+    # Use OpenAI TTS if available, else return 400 with reason
+    if not openai_client:
+        raise HTTPException(status_code=400, detail="TTS unavailable (no OpenAI client).")
+    try:
+        # openai 1.x style
+        speech = openai_client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            input=text,
+            format="mp3"
+        )
+        audio_bytes = speech.read() if hasattr(speech, "read") else speech  # depending on SDK version
+        if isinstance(audio_bytes, str):
+            audio_bytes = audio_bytes.encode("latin1")  # defensive
+        return Response(content=audio_bytes, media_type="audio/mpeg")
+    except Exception as e:
+        logger.exception("TTS failed")
+        raise HTTPException(status_code=400, detail=f"TTS error: {str(e)[:300]}")
+
+# ---------- Access log ----------
+@app.middleware("http")
+async def access_log(request: Request, call_next):
+    start = time.time()
+    response = await call_next(request)
+    elapsed = int((time.time() - start) * 1000)
+    logger.info(f"{request.method} {request.url.path}", extra={
+        "path": request.url.path, "method": request.method, "elapsed_ms": elapsed, "request_id": str(uuid.uuid4()),
+        "remote_addr": request.client.host if request.client else None
+    })
+    return response
