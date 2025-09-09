@@ -6,12 +6,15 @@ import uuid
 import random
 import tempfile
 import subprocess
+import urllib.parse
 from pathlib import Path
 from typing import Dict, Optional, List, Set
 
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi import UploadFile, File, Form
-from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse
+from fastapi.responses import (
+    HTMLResponse, JSONResponse, FileResponse, PlainTextResponse, Response
+)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
@@ -31,16 +34,24 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
 
 PASS_AVG_THRESHOLD = float(os.getenv("PASS_AVG_THRESHOLD", "0.70"))
 PASS_MIN_THRESHOLD = float(os.getenv("PASS_MIN_THRESHOLD", "0.60"))
+# If avg is between PASS_AVG_THRESHOLD and (PASS_AVG_THRESHOLD + PROBE_MARGIN),
+# we inject a probe level (e.g., B1 -> B1+, B2 -> B2+) before advancing.
+PROBE_MARGIN = float(os.getenv("PROBE_MARGIN", "0.05"))
+
 RECORD_SECONDS = int(os.getenv("RECORD_SECONDS", "60"))
 
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
+
+# TTS (optional)
+TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
+TTS_VOICE = os.getenv("TTS_VOICE", "alloy")  # alloy, verse, etc.
 
 # ---------- LLM/ASR clients (OpenAI style) ----------
 try:
     from openai import OpenAI
     openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
 except Exception:
-    logger.warning("OpenAI SDK not available or API key missing; falling back to dummy scoring.")
+    logger.warning("OpenAI SDK not available or API key missing; falling back to dummy scoring/TTS.")
     openai_client = None
 
 # ---------- App ----------
@@ -94,7 +105,10 @@ async def config():
         "WHISPER_MODEL": WHISPER_MODEL,
         "PASS_AVG_THRESHOLD": str(PASS_AVG_THRESHOLD),
         "PASS_MIN_THRESHOLD": str(PASS_MIN_THRESHOLD),
+        "PROBE_MARGIN": str(PROBE_MARGIN),
         "RECORD_SECONDS": RECORD_SECONDS,
+        "TTS_MODEL": TTS_MODEL,
+        "TTS_VOICE": TTS_VOICE,
     }
 
 # ---------- Session models / state ----------
@@ -109,10 +123,12 @@ class ScoreDict(BaseModel):
 
 class Turn(BaseModel):
     level: str
+    question: str
     transcript: str
     scores: ScoreDict
     average: float
     decision: str  # "advance" or "stop"
+    attempt: int   # 1 or 2 at that level
 
 class FinalReport(BaseModel):
     session_id: str
@@ -120,14 +136,24 @@ class FinalReport(BaseModel):
     history: List[Turn]
     recommendations: List[str] = Field(default_factory=list)
 
-# SESSIONS holds per-session state, including used question indices per level
+# SESSIONS holds per-session state, including used question indices per level and current question/attempt
 # SESSIONS[session_id] = {
 #   "current_level": "A1",
+#   "current_question": "....",
+#   "current_attempt": 1,
 #   "history": [Turn, ...],
 #   "final_level": Optional[str],
 #   "used_questions": { "A1": set(int,...), "A2": set(...) }
 # }
 SESSIONS: Dict[str, Dict] = {}
+
+# Mapping for probe levels (insert a probe level if borderline pass)
+PROBE_MAP: Dict[str, str] = {
+    "A2": "B1",
+    "B1": "B1+",
+    "B2": "B2+",
+    # optional: "C1": "C1" (no probe beyond C2)
+}
 
 # ---------- Guided prompt loading / selection ----------
 def _load_questions_for_level(level: str) -> List[str]:
@@ -147,12 +173,10 @@ def _load_questions_for_level(level: str) -> List[str]:
 
     if isinstance(data, dict):
         if isinstance(data.get("questions"), list) and data["questions"]:
-            # ensure strings
             return [str(q) for q in data["questions"] if isinstance(q, str) and q.strip()]
         instr = data.get("instructions")
         if isinstance(instr, str) and instr.strip():
             return [instr.strip()]
-
     return [f"Speak for ~60 seconds about a topic suitable for {level}."]
 
 def _choose_question_index(level: str, used: Set[int]) -> int:
@@ -166,7 +190,6 @@ def _choose_question_index(level: str, used: Set[int]) -> int:
         return 0
     candidates = [i for i in range(n) if i not in used]
     if not candidates:
-        # reset if exhausted
         used.clear()
         candidates = list(range(n))
     return random.choice(candidates)
@@ -188,7 +211,6 @@ def _get_question_for_session(level: str, session_id: Optional[str]) -> str:
         used_set.add(idx)
         return questions[idx]
 
-    # No session — stateless random
     return random.choice(questions)
 
 def _next_level(current: str) -> Optional[str]:
@@ -301,6 +323,16 @@ def _decide(scores: ScoreDict) -> bool:
     avg = sum(vals) / len(vals)
     return (avg >= PASS_AVG_THRESHOLD) and all(v >= PASS_MIN_THRESHOLD for v in vals)
 
+def _borderline_pass(scores: ScoreDict) -> bool:
+    """
+    A 'borderline pass' is when the average is >= PASS_AVG_THRESHOLD but < PASS_AVG_THRESHOLD + PROBE_MARGIN,
+    OR any category is within PROBE_MARGIN of PASS_MIN_THRESHOLD.
+    """
+    vals = [scores.fluency, scores.grammar, scores.vocabulary, scores.pronunciation, scores.coherence]
+    avg = sum(vals) / len(vals)
+    near_min = any((v - PASS_MIN_THRESHOLD) < PROBE_MARGIN for v in vals)
+    return (avg >= PASS_AVG_THRESHOLD and avg < PASS_AVG_THRESHOLD + PROBE_MARGIN) or near_min
+
 def _load_prompt(level: str, session_id: Optional[str] = None) -> str:
     """Return a guided question, session-aware if session_id present."""
     return _get_question_for_session(level, session_id)
@@ -331,6 +363,8 @@ async def transcribe_and_score(session_id: str, wav_file_path: str) -> Dict:
     if not state:
         raise HTTPException(status_code=404, detail="Session not found")
     level = state["current_level"]
+    question = state.get("current_question", f"(question unavailable for {level})")
+    attempt = int(state.get("current_attempt", 1))
 
     # 1) ASR
     transcript = await _asr_transcribe_file(wav_file_path)
@@ -346,27 +380,41 @@ async def transcribe_and_score(session_id: str, wav_file_path: str) -> Dict:
     )
     avg = (scores.fluency + scores.grammar + scores.vocabulary + scores.pronunciation + scores.coherence) / 5.0
     passed = _decide(scores)
+    borderline = _borderline_pass(scores) if passed else False
 
     decision = "advance" if passed else "stop"
     result: Dict = {
         "session_id": session_id,
         "level": level,
+        "question": question,
         "transcript": transcript,
         "scores": scores.model_dump(),
         "average": round(avg, 4),
         "decision": decision,
+        "attempt": attempt,
+        "borderline": borderline,
     }
 
-    # 3) Update session history
-    state["history"].append(Turn(level=level, transcript=transcript, scores=scores, average=avg, decision=decision))
+    # 3) Update session history (store question & attempt)
+    state["history"].append(Turn(level=level, question=question, transcript=transcript,
+                                 scores=scores, average=avg, decision=decision, attempt=attempt))
 
     if passed:
-        nxt = _next_level(level)
-        if nxt:
-            state["current_level"] = nxt
-            # Select the next prompt session-aware (avoid repeats)
-            result["next_level"] = nxt
-            result["next_prompt"] = _load_prompt(nxt, session_id=session_id)
+        # Decide if we should insert a probe level
+        next_lvl = _next_level(level)
+        if borderline and level in PROBE_MAP:
+            probe = PROBE_MAP[level]
+            # Only insert probe if it's not the same as current and exists in our CEFR list
+            if probe in CEFR_ORDER and probe != level:
+                next_lvl = probe
+
+        if next_lvl:
+            state["current_level"] = next_lvl
+            state["current_attempt"] = 1  # reset attempt counter for new level
+            next_q = _load_prompt(next_lvl, session_id=session_id)
+            state["current_question"] = next_q
+            result["next_level"] = next_lvl
+            result["next_prompt"] = next_q
         else:
             # already at top level; stop
             state["final_level"] = level
@@ -384,31 +432,45 @@ async def start_session(level: str = Form("A1")):
     if level not in CEFR_ORDER:
         level = "A1"
     session_id = str(uuid.uuid4())
+    first_q = _load_prompt(level, session_id=session_id)
     SESSIONS[session_id] = {
         "current_level": level,
+        "current_question": first_q,
+        "current_attempt": 1,
         "history": [],
-        # populated when stop:
+        # populated when stop
         # "final_level": str
         # used question indices per level:
         "used_questions": {}
     }
     logger.info("start-session", extra={"session_id": session_id, "level": level})
+    # Provide optional TTS URL for the UI to play the examiner voice
+    tts_url = f"/tts?text={urllib.parse.quote_plus(first_q)}"
     return {
         "session_id": session_id,
         "level": level,
-        # Serve a session-aware guided question
-        "prompt": _load_prompt(level, session_id=session_id),
+        "prompt": first_q,
+        "prompt_tts_url": tts_url
     }
 
 # Prompts by level (returns ONE guided question).
-# If session_id is provided (?session_id=UUID), it avoids repeats for that session.
+# If session_id is provided (?session_id=UUID), it avoids repeats for that session and updates the session's current_question.
 @app.get("/prompts/{level}")
 async def prompt_level(level: str, session_id: Optional[str] = Query(default=None)):
     if level not in CEFR_ORDER:
         raise HTTPException(status_code=404, detail=f"Unknown level: {level}")
+    q = _load_prompt(level, session_id=session_id)
+    # If session present, update the session's current question and reset attempt to 1 for retries/next-turns if needed.
+    if session_id and session_id in SESSIONS:
+        SESSIONS[session_id]["current_question"] = q
+        # When fetching a new question at the same level (retry), set attempt=2.
+        # The UI triggers this after a fail, so we set attempt=2, but only if level == current_level.
+        if SESSIONS[session_id].get("current_level") == level:
+            SESSIONS[session_id]["current_attempt"] = 2
     return JSONResponse({
         "level": level,
-        "instructions": _load_prompt(level, session_id=session_id)
+        "instructions": q,
+        "prompt_tts_url": f"/tts?text={urllib.parse.quote_plus(q)}"
     })
 
 @app.post("/submit-response")
@@ -467,13 +529,15 @@ async def evaluate_bytes(file: UploadFile = File(...)):
     """
     try:
         session_id = str(uuid.uuid4())
-        SESSIONS[session_id] = {"current_level": "A1", "history": [], "used_questions": {}}
+        SESSIONS[session_id] = {
+            "current_level": "A1", "current_question": "(single-shot)", "current_attempt": 1,
+            "history": [], "used_questions": {}
+        }
         src_path = _save_upload_to_temp(file)
         needs_conv = _infer_should_convert(file.content_type, file.filename)
         wav_path = src_path if not needs_conv else _ffmpeg_convert_to_wav16k_mono(src_path)
         try:
             out = await transcribe_and_score(session_id=session_id, wav_file_path=wav_path)
-            # do not advance; just return the first scoring
             out.pop("next_level", None)
             out.pop("next_prompt", None)
             return JSONResponse(out)
@@ -497,20 +561,56 @@ async def report(session_id: str):
         raise HTTPException(status_code=404, detail="Session not found")
     state = SESSIONS[session_id]
     final_level = state.get("final_level") or state["current_level"]
-    # simple recs
+
+    # Simple recs based on last turn’s lowest category
     recs: List[str] = []
     if state["history"]:
         last: Turn = state["history"][-1]
-        low = min(
+        lows = sorted(
             [("fluency", last.scores.fluency),
              ("grammar", last.scores.grammar),
              ("vocabulary", last.scores.vocabulary),
              ("pronunciation", last.scores.pronunciation),
              ("coherence", last.scores.coherence)],
             key=lambda x: x[1]
-        )[0]
-        recs.append(f"Focus more on {low}.")
+        )
+        focus = ", ".join([k for k, _ in lows[:2]])
+        recs.append(f"Focus more on: {focus}.")
+
     return FinalReport(session_id=session_id, final_level=final_level, history=state["history"], recommendations=recs)
+
+# ---------- TTS (examiner voice) ----------
+# GET /tts?text=...  or POST {"text": "..."} -> returns audio/mpeg
+@app.get("/tts")
+async def tts_get(text: str = Query(..., description="Text to synthesize")):
+    return await _tts_core(text)
+
+@app.post("/tts")
+async def tts_post(payload: Dict):
+    text = payload.get("text") if isinstance(payload, dict) else None
+    if not text or not isinstance(text, str):
+        raise HTTPException(status_code=400, detail="Missing 'text' in body.")
+    return await _tts_core(text)
+
+async def _tts_core(text: str):
+    # Use OpenAI TTS if available, else return 400 with reason
+    if not openai_client:
+        raise HTTPException(status_code=400, detail="TTS unavailable (no OpenAI client).")
+    try:
+        # openai 1.x style
+        speech = openai_client.audio.speech.create(
+            model=TTS_MODEL,
+            voice=TTS_VOICE,
+            input=text,
+            format="mp3"
+        )
+        audio_bytes = speech.read() if hasattr(speech, "read") else speech  # depending on SDK version
+        if isinstance(audio_bytes, str):
+            audio_bytes = audio_bytes.encode("latin1")  # defensive
+        return Response(content=audio_bytes, media_type="audio/mpeg")
+    except Exception as e:
+        logger.exception("TTS failed")
+        raise HTTPException(status_code=400, detail=f"TTS error: {str(e)[:300]}")
 
 # ---------- Access log ----------
 @app.middleware("http")
