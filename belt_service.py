@@ -3,14 +3,13 @@ import io
 import json
 import time
 import uuid
-import glob
-import math
+import random
 import tempfile
 import subprocess
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Set
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi import UploadFile, File, Form
 from fastapi.responses import HTMLResponse, JSONResponse, FileResponse, PlainTextResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -37,11 +36,10 @@ RECORD_SECONDS = int(os.getenv("RECORD_SECONDS", "60"))
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # ---------- LLM/ASR clients (OpenAI style) ----------
-# Supports modern openai SDK (client.chat.completions / client.audio.transcriptions)
 try:
     from openai import OpenAI
     openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
-except Exception as e:
+except Exception:
     logger.warning("OpenAI SDK not available or API key missing; falling back to dummy scoring.")
     openai_client = None
 
@@ -73,15 +71,6 @@ async def index():
         return HTMLResponse("<h1>BELT Speaking AI</h1><p>Frontend missing. Place web/index.html here.</p>", status_code=200)
     return HTMLResponse(idx.read_text(encoding="utf-8"))
 
-# Prompts by level
-@app.get("/prompts/{level}")
-async def prompt_level(level: str):
-    # accept B1+ style as filename B1+.json
-    p = PROMPTS_DIR / f"{level}.json"
-    if not p.exists():
-        raise HTTPException(status_code=404, detail=f"Prompt for level {level} not found")
-    return JSONResponse(json.loads(p.read_text(encoding="utf-8")))
-
 # ---------- Health / metrics ----------
 @app.get("/healthz")
 async def healthz():
@@ -89,7 +78,6 @@ async def healthz():
 
 @app.get("/metrics")
 async def metrics():
-    # Minimal Prometheus-style metrics
     lines = [
         "# HELP belt_requests_total Total requests.",
         "# TYPE belt_requests_total counter",
@@ -132,12 +120,81 @@ class FinalReport(BaseModel):
     history: List[Turn]
     recommendations: List[str] = Field(default_factory=list)
 
-SESSIONS: Dict[str, Dict] = {}  # session_id -> { current_level, history: [Turn], final_level? }
+# SESSIONS holds per-session state, including used question indices per level
+# SESSIONS[session_id] = {
+#   "current_level": "A1",
+#   "history": [Turn, ...],
+#   "final_level": Optional[str],
+#   "used_questions": { "A1": set(int,...), "A2": set(...) }
+# }
+SESSIONS: Dict[str, Dict] = {}
+
+# ---------- Guided prompt loading / selection ----------
+def _load_questions_for_level(level: str) -> List[str]:
+    """
+    Reads web/prompts/<LEVEL>.json.
+    If it contains "questions": [...], return that list.
+    Else, if it contains single "instructions": "...", return [that].
+    Else, return a generic fallback.
+    """
+    p = PROMPTS_DIR / f"{level}.json"
+    if not p.exists():
+        return [f"Speak for ~60 seconds about a topic suitable for {level}."]
+    try:
+        data = json.loads(p.read_text(encoding="utf-8"))
+    except Exception:
+        return [f"Speak for ~60 seconds about a topic suitable for {level}."]
+
+    if isinstance(data, dict):
+        if isinstance(data.get("questions"), list) and data["questions"]:
+            # ensure strings
+            return [str(q) for q in data["questions"] if isinstance(q, str) and q.strip()]
+        instr = data.get("instructions")
+        if isinstance(instr, str) and instr.strip():
+            return [instr.strip()]
+
+    return [f"Speak for ~60 seconds about a topic suitable for {level}."]
+
+def _choose_question_index(level: str, used: Set[int]) -> int:
+    """
+    Choose a question index not in 'used' if possible.
+    If all are used, reset (allow repeats) and choose again.
+    """
+    qs = _load_questions_for_level(level)
+    n = len(qs)
+    if n == 0:
+        return 0
+    candidates = [i for i in range(n) if i not in used]
+    if not candidates:
+        # reset if exhausted
+        used.clear()
+        candidates = list(range(n))
+    return random.choice(candidates)
+
+def _get_question_for_session(level: str, session_id: Optional[str]) -> str:
+    """
+    If session_id provided and valid, track used indices per level to avoid repeats.
+    Otherwise return a random question without tracking.
+    """
+    questions = _load_questions_for_level(level)
+    if not questions:
+        return f"Speak for ~60 seconds about a topic suitable for {level}."
+
+    if session_id and session_id in SESSIONS:
+        sess = SESSIONS[session_id]
+        used_map = sess.setdefault("used_questions", {})
+        used_set: Set[int] = used_map.setdefault(level, set())
+        idx = _choose_question_index(level, used_set)
+        used_set.add(idx)
+        return questions[idx]
+
+    # No session — stateless random
+    return random.choice(questions)
 
 def _next_level(current: str) -> Optional[str]:
     if current not in CEFR_ORDER:
         return None
-    idx = CEFR_ORDER.indexOf(current) if hasattr(CEFR_ORDER, "indexOf") else CEFR_ORDER.index(current)
+    idx = CEFR_ORDER.index(current)
     if idx + 1 < len(CEFR_ORDER):
         return CEFR_ORDER[idx + 1]
     return None
@@ -197,22 +254,19 @@ def _llm_score_transcript(transcript: str, level: str) -> Dict:
     Returns dict: {"fluency":..., ..., "feedback": "..."}
     """
     if not openai_client:
-        # Fallback: naive heuristic scoring for offline sanity
+        # Fallback heuristic if no API key
         length = len(transcript.split())
         base = min(1.0, max(0.1, length / 120))
         return {
             "fluency": round(base, 2),
             "grammar": round(base * 0.95, 2),
-            "vocabulary": round(base * 0.9, 2),
+            "vocabulary": round(base * 0.90, 2),
             "pronunciation": round(0.75, 2),
             "coherence": round(base * 0.92, 2),
             "feedback": "Heuristic offline scoring (no API key)."
         }
 
-    user_prompt = f"""Level: {level}
-Transcript:
-{transcript}
-"""
+    user_prompt = f"Level: {level}\nTranscript:\n{transcript}\n"
     resp = openai_client.chat.completions.create(
         model=RUBRIC_MODEL,
         messages=[
@@ -225,15 +279,14 @@ Transcript:
     try:
         data = json.loads(resp.choices[0].message.content)
         return data
-    except Exception as e:
+    except Exception:
         logger.exception("Failed to parse rubric model JSON; falling back to heuristic.")
-        # Heuristic fallback if parse fails
         length = len(transcript.split())
         base = min(1.0, max(0.1, length / 120))
         return {
             "fluency": round(base, 2),
             "grammar": round(base * 0.95, 2),
-            "vocabulary": round(base * 0.9, 2),
+            "vocabulary": round(base * 0.90, 2),
             "pronunciation": round(0.75, 2),
             "coherence": round(base * 0.92, 2),
             "feedback": "Heuristic fallback due to parse error."
@@ -248,18 +301,9 @@ def _decide(scores: ScoreDict) -> bool:
     avg = sum(vals) / len(vals)
     return (avg >= PASS_AVG_THRESHOLD) and all(v >= PASS_MIN_THRESHOLD for v in vals)
 
-def _load_prompt(level: str) -> str:
-    p = PROMPTS_DIR / f"{level}.json"
-    if not p.exists():
-        return f"Speak for ~60 seconds about a topic suitable for {level}."
-    try:
-        data = json.loads(p.read_text(encoding="utf-8"))
-        if isinstance(data, dict):
-            instr = data.get("instructions") or ""
-            return instr or f"Speak for ~60 seconds about a topic suitable for {level}."
-        return f"Speak for ~60 seconds about a topic suitable for {level}."
-    except Exception:
-        return f"Speak for ~60 seconds about a topic suitable for {level}."
+def _load_prompt(level: str, session_id: Optional[str] = None) -> str:
+    """Return a guided question, session-aware if session_id present."""
+    return _get_question_for_session(level, session_id)
 
 # ---------- Core pipeline ----------
 async def _asr_transcribe_file(wav_file_path: str) -> str:
@@ -276,7 +320,6 @@ async def _asr_transcribe_file(wav_file_path: str) -> str:
             file=f,
             response_format="text"
         )
-    # openai==1.x returns string for response_format="text"
     return trans if isinstance(trans, str) else str(trans)
 
 async def transcribe_and_score(session_id: str, wav_file_path: str) -> Dict:
@@ -321,8 +364,9 @@ async def transcribe_and_score(session_id: str, wav_file_path: str) -> Dict:
         nxt = _next_level(level)
         if nxt:
             state["current_level"] = nxt
+            # Select the next prompt session-aware (avoid repeats)
             result["next_level"] = nxt
-            result["next_prompt"] = _load_prompt(nxt)
+            result["next_prompt"] = _load_prompt(nxt, session_id=session_id)
         else:
             # already at top level; stop
             state["final_level"] = level
@@ -333,7 +377,7 @@ async def transcribe_and_score(session_id: str, wav_file_path: str) -> Dict:
 
     return result
 
-# ---------- API: start-session / submit-response / evaluate-bytes / report ----------
+# ---------- API: start-session / prompts / submit-response / evaluate-bytes / report ----------
 
 @app.post("/start-session")
 async def start_session(level: str = Form("A1")):
@@ -343,14 +387,29 @@ async def start_session(level: str = Form("A1")):
     SESSIONS[session_id] = {
         "current_level": level,
         "history": [],
-        # final_level populated when stop
+        # populated when stop:
+        # "final_level": str
+        # used question indices per level:
+        "used_questions": {}
     }
     logger.info("start-session", extra={"session_id": session_id, "level": level})
     return {
         "session_id": session_id,
         "level": level,
-        "prompt": _load_prompt(level),
+        # Serve a session-aware guided question
+        "prompt": _load_prompt(level, session_id=session_id),
     }
+
+# Prompts by level (returns ONE guided question).
+# If session_id is provided (?session_id=UUID), it avoids repeats for that session.
+@app.get("/prompts/{level}")
+async def prompt_level(level: str, session_id: Optional[str] = Query(default=None)):
+    if level not in CEFR_ORDER:
+        raise HTTPException(status_code=404, detail=f"Unknown level: {level}")
+    return JSONResponse({
+        "level": level,
+        "instructions": _load_prompt(level, session_id=session_id)
+    })
 
 @app.post("/submit-response")
 async def submit_response(
@@ -407,9 +466,8 @@ async def evaluate_bytes(file: UploadFile = File(...)):
     Single-shot evaluation (not adaptive). Returns scores/avg for a one-off clip.
     """
     try:
-        # Use a scratch session for single-shot
         session_id = str(uuid.uuid4())
-        SESSIONS[session_id] = {"current_level": "A1", "history": []}
+        SESSIONS[session_id] = {"current_level": "A1", "history": [], "used_questions": {}}
         src_path = _save_upload_to_temp(file)
         needs_conv = _infer_should_convert(file.content_type, file.filename)
         wav_path = src_path if not needs_conv else _ffmpeg_convert_to_wav16k_mono(src_path)
@@ -442,7 +500,7 @@ async def report(session_id: str):
     # simple recs
     recs: List[str] = []
     if state["history"]:
-        last = state["history"][-1]
+        last: Turn = state["history"][-1]
         low = min(
             [("fluency", last.scores.fluency),
              ("grammar", last.scores.grammar),
@@ -454,7 +512,7 @@ async def report(session_id: str):
         recs.append(f"Focus more on {low}.")
     return FinalReport(session_id=session_id, final_level=final_level, history=state["history"], recommendations=recs)
 
-# ---------- Error handlers ----------
+# ---------- Access log ----------
 @app.middleware("http")
 async def access_log(request: Request, call_next):
     start = time.time()
