@@ -1,9 +1,34 @@
 {
   "level": "B2",
-  "instructions": "Speak for ~60 seconds about a topic suitable for B2.",
+  "questions": [
+    "Do you think social media has more positive or negative effects on society?",
+    "Tell me about a time you had to work with a difficult person.",
+    "What are the benefits and drawbacks of studying abroad?",
+    "Do you think technology will replace teachers one day?",
+    "Tell me about a book or film that changed your perspective.",
+    "Do you think advertisements influence our choices too much?",
+    "What are the challenges of living in a big city?",
+    "Tell me about an achievement you are proud of.",
+    "Do you think tourism is always good for local communities?",
+    "Tell me about a challenge you overcame.",
+    "What are the advantages and disadvantages of working from home?",
+    "Do you think governments should ban junk food advertising?",
+    "Tell me about a person who inspired you.",
+    "Do you think climate change is the biggest issue today? Why?",
+    "What are the advantages of speaking more than one language?",
+    "Tell me about a subject you would like to study in the future.",
+    "Do you think money makes people happy? Why or why not?",
+    "What are the benefits and risks of online shopping?",
+    "Tell me about a difficult choice you made recently.",
+    "Do you think it’s better to rent or buy a house? Why?",
+    "What are the advantages and disadvantages of online education?",
+    "Tell me about an invention you think is important.",
+    "Do you think fashion is important? Why or why not?",
+    "What are the advantages and disadvantages of owning a car?"
+  ],
   "tips": [
-    "Be clear",
-    "Use examples",
-    "Organize ideas"
+    "Speak clearly and for about 60 seconds.",
+    "Try to organize your ideas.",
+    "Give examples when possible."
   ]
 }

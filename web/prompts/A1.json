@@ -1,9 +1,34 @@
 {
   "level": "A1",
-  "instructions": "Speak for ~60 seconds about a topic suitable for A1.",
+  "questions": [
+    "What is your name and where are you from?",
+    "Describe your family.",
+    "What do you usually eat for breakfast?",
+    "Tell me about your favorite color.",
+    "What is your favorite food? Why?",
+    "Describe your house or apartment.",
+    "Tell me about your best friend.",
+    "What time do you usually wake up?",
+    "What is your favorite animal?",
+    "Describe what you usually do on weekends.",
+    "What do you usually wear to school or work?",
+    "What do you usually drink during the day?",
+    "What is your favorite season? Why?",
+    "Tell me about a place you like to visit in your town.",
+    "What do you usually do after school or work?",
+    "Describe your favorite holiday or festival.",
+    "Who cooks in your family?",
+    "Do you like sports? Which ones?",
+    "What is your favorite hobby?",
+    "What is the weather like today?",
+    "What’s in your bag or backpack right now?",
+    "What is your favorite subject at school?",
+    "What do you do when you are happy?",
+    "What’s your favorite drink?"
+  ],
   "tips": [
-    "Be clear",
-    "Use examples",
-    "Organize ideas"
+    "Speak clearly and for about 60 seconds.",
+    "Try to organize your ideas.",
+    "Give examples when possible."
   ]
 }

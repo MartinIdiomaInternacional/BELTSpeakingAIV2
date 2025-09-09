@@ -1,9 +1,34 @@
 {
   "level": "B1+",
-  "instructions": "Speak for ~60 seconds about a topic suitable for B1+.",
+  "questions": [
+    "Tell me about a time when you had to make a difficult decision.",
+    "Do you think technology makes our lives easier or more complicated?",
+    "Describe a place where you would like to live in the future.",
+    "Tell me about a problem you solved recently.",
+    "What are the advantages and disadvantages of public transport?",
+    "Do you prefer reading books or watching movies? Why?",
+    "Tell me about an interesting tradition in your country.",
+    "What are the advantages of having hobbies?",
+    "Do you think people should recycle more? Why?",
+    "Tell me about a sport you enjoy watching or playing.",
+    "What are the challenges of learning a new language?",
+    "Tell me about a project you worked on at school or work.",
+    "Do you think young people watch too much TV? Why or why not?",
+    "Tell me about a good habit you have.",
+    "Do you prefer to travel by plane, train, or car? Why?",
+    "Tell me about a memorable day with your friends.",
+    "Do you think it is important to eat healthy food?",
+    "Tell me about an important event in your life.",
+    "What are the advantages of using the internet?",
+    "Do you prefer to work alone or in a team? Why?",
+    "Tell me about a goal you have for the future.",
+    "Do you think learning English will help you in the future? How?",
+    "Tell me about a festival or celebration in your country.",
+    "Do you think it’s better to watch news on TV or online? Why?"
+  ],
   "tips": [
-    "Be clear",
-    "Use examples",
-    "Organize ideas"
+    "Speak clearly and for about 60 seconds.",
+    "Try to organize your ideas.",
+    "Give examples when possible."
   ]
 }

@@ -1,9 +1,34 @@
 {
   "level": "A2",
-  "instructions": "Speak for ~60 seconds about a topic suitable for A2.",
+  "questions": [
+    "Tell me about your daily routine.",
+    "Describe your best holiday.",
+    "What do you usually do with your friends?",
+    "What kind of music do you like?",
+    "Tell me about your favorite restaurant.",
+    "What do you usually do in the evenings?",
+    "Tell me about a movie you enjoyed.",
+    "Describe your bedroom.",
+    "What do you usually buy when you go shopping?",
+    "What is your favorite TV program?",
+    "Describe a person in your family.",
+    "What is your favorite activity on weekends?",
+    "Tell me about your school or workplace.",
+    "What do you usually do in summer?",
+    "What did you do last weekend?",
+    "What do you usually eat for lunch?",
+    "Tell me about your favorite teacher.",
+    "Do you prefer the beach or the mountains? Why?",
+    "What do you usually do when you are bored?",
+    "Tell me about a special day in your life.",
+    "What is your favorite kind of transport?",
+    "What’s your favorite book?",
+    "Tell me about your last birthday.",
+    "What’s your favorite sport to watch?"
+  ],
   "tips": [
-    "Be clear",
-    "Use examples",
-    "Organize ideas"
+    "Speak clearly and for about 60 seconds.",
+    "Try to organize your ideas.",
+    "Give examples when possible."
   ]
 }

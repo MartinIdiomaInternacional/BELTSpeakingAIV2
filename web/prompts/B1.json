@@ -1,9 +1,34 @@
 {
   "level": "B1",
-  "instructions": "Speak for ~60 seconds about a topic suitable for B1.",
+  "questions": [
+    "Describe a holiday you really enjoyed.",
+    "Tell me about a time you helped someone.",
+    "What’s your opinion about using mobile phones in class?",
+    "Tell me about a hobby you have and why you enjoy it.",
+    "What do you usually do on your birthday?",
+    "Describe your favorite type of music and why.",
+    "Tell me about a book or film that you liked.",
+    "What do you usually do when you travel?",
+    "Do you prefer going to the cinema or watching films at home?",
+    "Tell me about your future plans.",
+    "What is the most interesting place you have visited?",
+    "Do you prefer summer or winter holidays? Why?",
+    "What’s your opinion about fast food?",
+    "Tell me about a teacher who influenced you.",
+    "Do you prefer living in the city or the countryside? Why?",
+    "What do you usually do when you are with your friends?",
+    "What are the advantages of learning English?",
+    "Describe a famous person you admire.",
+    "Do you like cooking? Why or why not?",
+    "Tell me about something you learned recently.",
+    "Do you prefer online shopping or going to shops?",
+    "What do you do to relax?",
+    "What is your favorite festival?",
+    "What’s your opinion about keeping pets?"
+  ],
   "tips": [
-    "Be clear",
-    "Use examples",
-    "Organize ideas"
+    "Speak clearly and for about 60 seconds.",
+    "Try to organize your ideas.",
+    "Give examples when possible."
   ]
 }
