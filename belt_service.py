@@ -13,7 +13,7 @@ from typing import Dict, Optional, List, Set
 from fastapi import FastAPI, HTTPException, Request, Query
 from fastapi import UploadFile, File, Form
 from fastapi.responses import (
-    HTMLResponse, JSONResponse, FileResponse, PlainTextResponse, Response
+    HTMLResponse, JSONResponse, PlainTextResponse, Response
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -34,8 +34,7 @@ WHISPER_MODEL = os.getenv("WHISPER_MODEL", "whisper-1")
 
 PASS_AVG_THRESHOLD = float(os.getenv("PASS_AVG_THRESHOLD", "0.70"))
 PASS_MIN_THRESHOLD = float(os.getenv("PASS_MIN_THRESHOLD", "0.60"))
-# If avg is between PASS_AVG_THRESHOLD and (PASS_AVG_THRESHOLD + PROBE_MARGIN),
-# we inject a probe level (e.g., B1 -> B1+, B2 -> B2+) before advancing.
+# Borderline passes trigger probe levels within this margin
 PROBE_MARGIN = float(os.getenv("PROBE_MARGIN", "0.05"))
 
 RECORD_SECONDS = int(os.getenv("RECORD_SECONDS", "60"))
@@ -44,7 +43,7 @@ OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
 
 # TTS (optional)
 TTS_MODEL = os.getenv("TTS_MODEL", "gpt-4o-mini-tts")
-TTS_VOICE = os.getenv("TTS_VOICE", "alloy")  # alloy, verse, etc.
+TTS_VOICE = os.getenv("TTS_VOICE", "alloy")
 
 # ---------- LLM/ASR clients (OpenAI style) ----------
 try:
@@ -128,7 +127,7 @@ class Turn(BaseModel):
     scores: ScoreDict
     average: float
     decision: str  # "advance" or "stop"
-    attempt: int   # 1 or 2 at that level
+    attempt: int   # 1, 2, ...
 
 class FinalReport(BaseModel):
     session_id: str
@@ -136,11 +135,11 @@ class FinalReport(BaseModel):
     history: List[Turn]
     recommendations: List[str] = Field(default_factory=list)
 
-# SESSIONS holds per-session state, including used question indices per level and current question/attempt
+# SESSIONS holds per-session state, including used question indices per level and current question.
 # SESSIONS[session_id] = {
 #   "current_level": "A1",
 #   "current_question": "....",
-#   "current_attempt": 1,
+#   "current_prompt_id": Optional[int],
 #   "history": [Turn, ...],
 #   "final_level": Optional[str],
 #   "used_questions": { "A1": set(int,...), "A2": set(...) }
@@ -152,7 +151,6 @@ PROBE_MAP: Dict[str, str] = {
     "A2": "B1",
     "B1": "B1+",
     "B2": "B2+",
-    # optional: "C1": "C1" (no probe beyond C2)
 }
 
 # ---------- Guided prompt loading / selection ----------
@@ -194,14 +192,14 @@ def _choose_question_index(level: str, used: Set[int]) -> int:
         candidates = list(range(n))
     return random.choice(candidates)
 
-def _get_question_for_session(level: str, session_id: Optional[str]) -> str:
+def _get_question_for_session(level: str, session_id: Optional[str]) -> (str, Optional[int]):
     """
     If session_id provided and valid, track used indices per level to avoid repeats.
-    Otherwise return a random question without tracking.
+    Returns (question_text, prompt_id). If stateless, prompt_id may be None.
     """
     questions = _load_questions_for_level(level)
     if not questions:
-        return f"Speak for ~60 seconds about a topic suitable for {level}."
+        return (f"Speak for ~60 seconds about a topic suitable for {level}.", None)
 
     if session_id and session_id in SESSIONS:
         sess = SESSIONS[session_id]
@@ -209,9 +207,15 @@ def _get_question_for_session(level: str, session_id: Optional[str]) -> str:
         used_set: Set[int] = used_map.setdefault(level, set())
         idx = _choose_question_index(level, used_set)
         used_set.add(idx)
-        return questions[idx]
+        return (questions[idx], idx)
 
-    return random.choice(questions)
+    # No session — stateless random
+    q = random.choice(questions)
+    try:
+        idx = questions.index(q)
+    except ValueError:
+        idx = None
+    return (q, idx)
 
 def _next_level(current: str) -> Optional[str]:
     if current not in CEFR_ORDER:
@@ -325,17 +329,13 @@ def _decide(scores: ScoreDict) -> bool:
 
 def _borderline_pass(scores: ScoreDict) -> bool:
     """
-    A 'borderline pass' is when the average is >= PASS_AVG_THRESHOLD but < PASS_AVG_THRESHOLD + PROBE_MARGIN,
-    OR any category is within PROBE_MARGIN of PASS_MIN_THRESHOLD.
+    'Borderline pass' when avg in [PASS_AVG_THRESHOLD, PASS_AVG_THRESHOLD+PROBE_MARGIN)
+    or any category within PROBE_MARGIN of PASS_MIN_THRESHOLD.
     """
     vals = [scores.fluency, scores.grammar, scores.vocabulary, scores.pronunciation, scores.coherence]
     avg = sum(vals) / len(vals)
     near_min = any((v - PASS_MIN_THRESHOLD) < PROBE_MARGIN for v in vals)
     return (avg >= PASS_AVG_THRESHOLD and avg < PASS_AVG_THRESHOLD + PROBE_MARGIN) or near_min
-
-def _load_prompt(level: str, session_id: Optional[str] = None) -> str:
-    """Return a guided question, session-aware if session_id present."""
-    return _get_question_for_session(level, session_id)
 
 # ---------- Core pipeline ----------
 async def _asr_transcribe_file(wav_file_path: str) -> str:
@@ -354,7 +354,13 @@ async def _asr_transcribe_file(wav_file_path: str) -> str:
         )
     return trans if isinstance(trans, str) else str(trans)
 
-async def transcribe_and_score(session_id: str, wav_file_path: str) -> Dict:
+async def transcribe_and_score(
+    session_id: str,
+    wav_file_path: str,
+    *,
+    question: str,
+    attempt: int
+) -> Dict:
     """
     End-to-end: ASR -> LLM scoring -> adaptive decision & next prompt.
     Updates SESSIONS[session_id]["history"] and returns a response dict for the UI.
@@ -363,8 +369,6 @@ async def transcribe_and_score(session_id: str, wav_file_path: str) -> Dict:
     if not state:
         raise HTTPException(status_code=404, detail="Session not found")
     level = state["current_level"]
-    question = state.get("current_question", f"(question unavailable for {level})")
-    attempt = int(state.get("current_attempt", 1))
 
     # 1) ASR
     transcript = await _asr_transcribe_file(wav_file_path)
@@ -404,19 +408,18 @@ async def transcribe_and_score(session_id: str, wav_file_path: str) -> Dict:
         next_lvl = _next_level(level)
         if borderline and level in PROBE_MAP:
             probe = PROBE_MAP[level]
-            # Only insert probe if it's not the same as current and exists in our CEFR list
             if probe in CEFR_ORDER and probe != level:
                 next_lvl = probe
 
         if next_lvl:
             state["current_level"] = next_lvl
-            state["current_attempt"] = 1  # reset attempt counter for new level
-            next_q = _load_prompt(next_lvl, session_id=session_id)
+            next_q, next_id = _get_question_for_session(next_lvl, session_id=session_id)
             state["current_question"] = next_q
+            state["current_prompt_id"] = next_id
             result["next_level"] = next_lvl
             result["next_prompt"] = next_q
+            result["next_prompt_id"] = next_id
         else:
-            # already at top level; stop
             state["final_level"] = level
             result["decision"] = "stop"
     else:
@@ -425,18 +428,18 @@ async def transcribe_and_score(session_id: str, wav_file_path: str) -> Dict:
 
     return result
 
-# ---------- API: start-session / prompts / submit-response / evaluate-bytes / report ----------
+# ---------- API: start-session / prompts / submit-response / evaluate-bytes / report / tts ----------
 
 @app.post("/start-session")
 async def start_session(level: str = Form("A1")):
     if level not in CEFR_ORDER:
         level = "A1"
     session_id = str(uuid.uuid4())
-    first_q = _load_prompt(level, session_id=session_id)
+    first_q, first_id = _get_question_for_session(level, session_id=session_id)
     SESSIONS[session_id] = {
         "current_level": level,
         "current_question": first_q,
-        "current_attempt": 1,
+        "current_prompt_id": first_id,
         "history": [],
         # populated when stop
         # "final_level": str
@@ -444,32 +447,29 @@ async def start_session(level: str = Form("A1")):
         "used_questions": {}
     }
     logger.info("start-session", extra={"session_id": session_id, "level": level})
-    # Provide optional TTS URL for the UI to play the examiner voice
     tts_url = f"/tts?text={urllib.parse.quote_plus(first_q)}"
     return {
         "session_id": session_id,
         "level": level,
         "prompt": first_q,
+        "prompt_id": first_id,
         "prompt_tts_url": tts_url
     }
 
-# Prompts by level (returns ONE guided question).
-# If session_id is provided (?session_id=UUID), it avoids repeats for that session and updates the session's current_question.
+# Prompts by level (returns ONE guided question + prompt_id).
+# If session_id is provided (?session_id=UUID), it avoids repeats and updates session current_question/current_prompt_id.
 @app.get("/prompts/{level}")
 async def prompt_level(level: str, session_id: Optional[str] = Query(default=None)):
     if level not in CEFR_ORDER:
         raise HTTPException(status_code=404, detail=f"Unknown level: {level}")
-    q = _load_prompt(level, session_id=session_id)
-    # If session present, update the session's current question and reset attempt to 1 for retries/next-turns if needed.
+    q, qid = _get_question_for_session(level, session_id=session_id)
     if session_id and session_id in SESSIONS:
         SESSIONS[session_id]["current_question"] = q
-        # When fetching a new question at the same level (retry), set attempt=2.
-        # The UI triggers this after a fail, so we set attempt=2, but only if level == current_level.
-        if SESSIONS[session_id].get("current_level") == level:
-            SESSIONS[session_id]["current_attempt"] = 2
+        SESSIONS[session_id]["current_prompt_id"] = qid
     return JSONResponse({
         "level": level,
         "instructions": q,
+        "prompt_id": qid,
         "prompt_tts_url": f"/tts?text={urllib.parse.quote_plus(q)}"
     })
 
@@ -480,6 +480,9 @@ async def submit_response(
     audio: Optional[UploadFile] = File(default=None),
     audio_file: Optional[UploadFile] = File(default=None),
     session_id: str = Form(...),
+    # New: allow frontend to send exact identifiers for perfect logging
+    question: Optional[str] = Form(default=None),
+    prompt_id: Optional[str] = Form(default=None),  # may come as string from FormData
 ):
     """
     Accepts recorded audio from the UI and advances/stops adaptively.
@@ -493,12 +496,63 @@ async def submit_response(
         if upload is None:
             raise HTTPException(status_code=400, detail="No audio file received. Expected 'file' (or 'audio'/'audio_file').")
 
+        # Determine level first
+        level = SESSIONS[session_id]["current_level"]
+
+        # Resolve q_text from (prompt_id) > (question text) > (session) > (fresh)
+        q_text = None
+        # Try prompt_id (index into question bank)
+        qid_int: Optional[int] = None
+        if prompt_id is not None:
+            try:
+                qid_int = int(prompt_id)
+            except Exception:
+                qid_int = None
+        if qid_int is not None:
+            questions = _load_questions_for_level(level)
+            if 0 <= qid_int < len(questions):
+                q_text = questions[qid_int]
+
+        # Fallback to provided question text
+        if not q_text and question and isinstance(question, str) and question.strip():
+            q_text = question.strip()
+
+        # Fallback to session's current question
+        if not q_text:
+            q_text = SESSIONS[session_id].get("current_question")
+
+        # Last resort: pick one now (and inject into session so it's consistent)
+        if not q_text:
+            q_text, qid = _get_question_for_session(level, session_id=session_id)
+            SESSIONS[session_id]["current_question"] = q_text
+            SESSIONS[session_id]["current_prompt_id"] = qid
+
+        # Persist chosen question id if we derived it
+        if qid_int is not None:
+            SESSIONS[session_id]["current_prompt_id"] = qid_int
+        else:
+            # Try to back-compute index for consistency
+            qs = _load_questions_for_level(level)
+            try:
+                SESSIONS[session_id]["current_prompt_id"] = qs.index(q_text)
+            except Exception:
+                SESSIONS[session_id]["current_prompt_id"] = None
+
+        # Compute attempt based on prior history at this level
+        prev_turns_same_level = sum(1 for t in SESSIONS[session_id]["history"] if t.level == level)
+        attempt = prev_turns_same_level + 1
+
         src_path = _save_upload_to_temp(upload)
         needs_conv = _infer_should_convert(upload.content_type, upload.filename)
         wav_path = src_path if not needs_conv else _ffmpeg_convert_to_wav16k_mono(src_path)
 
         try:
-            result = await transcribe_and_score(session_id=session_id, wav_file_path=wav_path)
+            result = await transcribe_and_score(
+                session_id=session_id,
+                wav_file_path=wav_path,
+                question=q_text,
+                attempt=attempt
+            )
         finally:
             try:
                 if os.path.exists(src_path):
@@ -529,17 +583,27 @@ async def evaluate_bytes(file: UploadFile = File(...)):
     """
     try:
         session_id = str(uuid.uuid4())
+        first_q, first_id = _get_question_for_session("A1", session_id=session_id)
         SESSIONS[session_id] = {
-            "current_level": "A1", "current_question": "(single-shot)", "current_attempt": 1,
-            "history": [], "used_questions": {}
+            "current_level": "A1",
+            "current_question": first_q,
+            "current_prompt_id": first_id,
+            "history": [],
+            "used_questions": {}
         }
         src_path = _save_upload_to_temp(file)
         needs_conv = _infer_should_convert(file.content_type, file.filename)
         wav_path = src_path if not needs_conv else _ffmpeg_convert_to_wav16k_mono(src_path)
         try:
-            out = await transcribe_and_score(session_id=session_id, wav_file_path=wav_path)
+            out = await transcribe_and_score(
+                session_id=session_id,
+                wav_file_path=wav_path,
+                question=first_q,
+                attempt=1
+            )
             out.pop("next_level", None)
             out.pop("next_prompt", None)
+            out.pop("next_prompt_id", None)
             return JSONResponse(out)
         finally:
             try:
@@ -562,7 +626,7 @@ async def report(session_id: str):
     state = SESSIONS[session_id]
     final_level = state.get("final_level") or state["current_level"]
 
-    # Simple recs based on last turn’s lowest category
+    # Simple recommendations based on last turn’s lowest category
     recs: List[str] = []
     if state["history"]:
         last: Turn = state["history"][-1]
@@ -593,20 +657,18 @@ async def tts_post(payload: Dict):
     return await _tts_core(text)
 
 async def _tts_core(text: str):
-    # Use OpenAI TTS if available, else return 400 with reason
     if not openai_client:
         raise HTTPException(status_code=400, detail="TTS unavailable (no OpenAI client).")
     try:
-        # openai 1.x style
         speech = openai_client.audio.speech.create(
             model=TTS_MODEL,
             voice=TTS_VOICE,
             input=text,
             format="mp3"
         )
-        audio_bytes = speech.read() if hasattr(speech, "read") else speech  # depending on SDK version
+        audio_bytes = speech.read() if hasattr(speech, "read") else speech
         if isinstance(audio_bytes, str):
-            audio_bytes = audio_bytes.encode("latin1")  # defensive
+            audio_bytes = audio_bytes.encode("latin1")
         return Response(content=audio_bytes, media_type="audio/mpeg")
     except Exception as e:
         logger.exception("TTS failed")
