@@ -1,21 +1,23 @@
 /* ===========================
-   BELT Voice Evaluator - Main JS
+   BELT Voice Evaluator - Main JS (stable)
    ===========================
    - Session-aware guided prompts (no repeats)
    - Sends prompt_id/question with submissions
-   - Records WebM/Opus via MediaRecorder
+   - Records WebM/Opus via MediaRecorder (with fallbacks)
    - Progress bar, timer, Stop & Send
    - Renders per-category chips + average
    - TTS playback of prompts (if available)
+   - Extra guards + logging to avoid “page freeze”
 */
 
 // ===========================
 // CONFIG
 // ===========================
-const API_BASE = ""; // same-origin backend. If different domain, e.g. "https://beltspeakingaiv2.onrender.com"
+const API_BASE = ""; // same-origin backend. If different domain, set full origin.
 const CONFIG_ENDPOINT = `${API_BASE}/config`;
+const FETCH_OPTS = { cache: "no-store" }; // avoid stale /config
 
-// SELECTORS (change here if your HTML uses different IDs)
+// SELECTORS (change here if HTML uses different IDs)
 const SEL = {
   btnStart: "#btnStart",
   btnRetry: "#btnRetry",
@@ -42,7 +44,7 @@ const STR = {
   error: "Something went wrong.",
 };
 
-// COLORS for score chips (light hint only; keep CSS in your stylesheet ideally)
+// COLORS for score chips
 const SCORE_COLORS = {
   good: "#16a34a",
   mid: "#f59e0b",
@@ -66,40 +68,38 @@ let mediaStream = null;
 let mediaRecorder = null;
 let recordedChunks = [];
 let isRecording = false;
+let hasStoppedRecorder = false;
 let timerInterval = null;
 let startTimestamp = null;
 
 // ===========================
+// Global error -> show in UI
+// ===========================
+window.addEventListener("error", (e) => {
+  appendMessage(`JS Error: ${e.message}`, "error");
+  console.error(e.error || e.message);
+});
+window.addEventListener("unhandledrejection", (e) => {
+  appendMessage(`Async Error: ${e.reason}`, "error");
+  console.error(e.reason);
+});
+
+// ===========================
 // DOM Helpers
 // ===========================
-function $(sel) {
-  return document.querySelector(sel);
-}
-function setText(sel, text) {
-  const el = $(sel);
-  if (el) el.textContent = text;
-}
-function setHTML(sel, html) {
-  const el = $(sel);
-  if (el) el.innerHTML = html;
-}
-function setDisabled(sel, disabled) {
-  const el = $(sel);
-  if (el) el.disabled = disabled;
-}
+function $(sel) { return document.querySelector(sel); }
+function setText(sel, text) { const el = $(sel); if (el) el.textContent = text; }
+function setHTML(sel, html) { const el = $(sel); if (el) el.innerHTML = html; }
+function setDisabled(sel, disabled) { const el = $(sel); if (el) el.disabled = disabled; }
 function appendMessage(msg, type = "info") {
-  const el = $(SEL.messages);
-  if (!el) return;
+  const el = $(SEL.messages); if (!el) return;
   const div = document.createElement("div");
   div.className = `msg ${type}`;
   div.textContent = msg;
   el.prepend(div);
 }
 function safeAudioPlay(url) {
-  try {
-    const a = new Audio(url);
-    a.play().catch(() => {});
-  } catch (e) {}
+  try { const a = new Audio(url); a.play().catch(() => {}); } catch (_) {}
 }
 
 // ===========================
@@ -109,14 +109,10 @@ function renderPrompt(prompt, level) {
   setText(SEL.levelBadge, level || "");
   setText(SEL.promptText, prompt || STR.defaultPrompt);
 }
-
 function renderScores(result) {
   const box = $(SEL.scoresContainer);
   if (!box) return;
-  if (!result || !result.scores) {
-    setHTML(SEL.scoresContainer, "");
-    return;
-  }
+  if (!result || !result.scores) { setHTML(SEL.scoresContainer, ""); return; }
   const s = result.scores;
   const avg = result.average ?? 0;
 
@@ -149,19 +145,12 @@ function renderScores(result) {
   `;
   setHTML(SEL.scoresContainer, html);
 }
-
 function renderFinalReportLink(sessionId) {
-  const el = $(SEL.finalReport);
-  if (!el) return;
+  const el = $(SEL.finalReport); if (!el) return;
   const url = `${API_BASE}/report/${encodeURIComponent(sessionId)}`;
-  el.innerHTML = `
-    <a href="${url}" target="_blank" rel="noopener">Open Final Report</a>
-  `;
+  el.innerHTML = `<a href="${url}" target="_blank" rel="noopener">Open Final Report</a>`;
 }
-
-function resetScoresUI() {
-  setHTML(SEL.scoresContainer, "");
-}
+function resetScoresUI() { setHTML(SEL.scoresContainer, ""); }
 
 // ===========================
 // Progress Bar & Timer
@@ -172,7 +161,6 @@ function resetProgressUI() {
   if (bar) bar.style.width = "0%";
   if (t) t.textContent = `0/${RECORD_SECONDS}s`;
 }
-
 function startTimer() {
   resetProgressUI();
   startTimestamp = Date.now();
@@ -188,50 +176,92 @@ function startTimer() {
     }
   }, 250);
 }
-
 function stopTimer() {
-  clearInterval(timerInterval);
-  timerInterval = null;
+  if (timerInterval) { clearInterval(timerInterval); timerInterval = null; }
 }
 
 // ===========================
-// Recorder
+// Recorder (with fallbacks)
 // ===========================
 async function startRecording() {
   if (isRecording) return;
   appendMessage(STR.starting);
+
   try {
+    // Require a session
+    if (!SESSION_ID) {
+      appendMessage("Start a session first.", "error");
+      return;
+    }
+
     mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+    recordedChunks = [];
+
+    // Try preferred MIME, then fallback gracefully
+    mediaRecorder = tryCreateRecorder(mediaStream, [
+      "audio/webm;codecs=opus",
+      "audio/webm",
+      "audio/ogg;codecs=opus",
+      "audio/mp4",
+      "" // let browser pick default
+    ]);
+    if (!mediaRecorder) {
+      appendMessage("Your browser does not support MediaRecorder audio.", "error");
+      cleanupStream();
+      return;
+    }
+
+    mediaRecorder.ondataavailable = (e) => {
+      if (e.data && e.data.size > 0) recordedChunks.push(e.data);
+    };
+    mediaRecorder.onstop = handleRecorderStop;
+
+    hasStoppedRecorder = false;
+    mediaRecorder.start(); // no timeslice -> continuous until stop()
+    isRecording = true;
+
+    setDisabled(SEL.btnStart, true);
+    setDisabled(SEL.btnStopSend, false);
+    appendMessage(STR.recording);
+    startTimer();
   } catch (e) {
-    appendMessage("Mic permission denied.", "error");
-    return;
+    appendMessage("Mic error. Check permissions.", "error");
+    console.error(e);
+    cleanupStream();
   }
+}
 
-  recordedChunks = [];
-  mediaRecorder = new MediaRecorder(mediaStream, { mimeType: "audio/webm;codecs=opus" });
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) recordedChunks.push(e.data);
-  };
-  mediaRecorder.onstop = handleRecorderStop;
+function tryCreateRecorder(stream, mimeList) {
+  for (const mt of mimeList) {
+    try {
+      if (mt && !MediaRecorder.isTypeSupported(mt)) continue;
+      const r = mt ? new MediaRecorder(stream, { mimeType: mt }) : new MediaRecorder(stream);
+      appendMessage(`Recorder MIME: ${r.mimeType || mt || "default"}`);
+      return r;
+    } catch (_) {
+      // try next
+    }
+  }
+  return null;
+}
 
-  mediaRecorder.start();
-  isRecording = true;
-  setDisabled(SEL.btnStart, true);
-  setDisabled(SEL.btnStopSend, false);
-  appendMessage(STR.recording);
-  startTimer();
+function cleanupStream() {
+  if (mediaStream) {
+    try { mediaStream.getTracks().forEach(t => t.stop()); } catch (_) {}
+    mediaStream = null;
+  }
 }
 
 function handleRecorderStop() {
   stopTimer();
-  if (mediaStream) {
-    mediaStream.getTracks().forEach((t) => t.stop());
-  }
+  cleanupStream();
   isRecording = false;
   setDisabled(SEL.btnStart, false);
   setDisabled(SEL.btnStopSend, true);
 
-  const blob = new Blob(recordedChunks, { type: "audio/webm" });
+  const blobType = (mediaRecorder && mediaRecorder.mimeType) ? mediaRecorder.mimeType : "audio/webm";
+  const blob = new Blob(recordedChunks, { type: blobType });
 
   // optional preview
   const audioEl = $(SEL.audioPreview);
@@ -242,13 +272,16 @@ function handleRecorderStop() {
   // Send automatically after stop
   submitRecording(blob).catch((e) => {
     appendMessage(`${STR.error} ${e?.message || e}`, "error");
+    console.error(e);
   });
 }
 
 function stopRecordingAndSend() {
   if (!isRecording || !mediaRecorder) return;
+  if (hasStoppedRecorder) return; // prevent double stop()
+  hasStoppedRecorder = true;
   appendMessage(STR.stopped);
-  mediaRecorder.stop();
+  try { mediaRecorder.stop(); } catch (e) { /* ignore */ }
 }
 
 // ===========================
@@ -256,13 +289,16 @@ function stopRecordingAndSend() {
 // ===========================
 async function loadConfig() {
   try {
-    const resp = await fetch(CONFIG_ENDPOINT);
+    const resp = await fetch(CONFIG_ENDPOINT, FETCH_OPTS);
     const cfg = await resp.json();
-    RECORD_SECONDS = cfg.RECORD_SECONDS ?? RECORD_SECONDS;
+    // Enforce a minimum of 60s if backend is stale
+    const rec = parseInt(cfg.RECORD_SECONDS ?? RECORD_SECONDS, 10);
+    RECORD_SECONDS = Number.isFinite(rec) ? Math.max(60, rec) : 60;
     PASS_AVG_THRESHOLD = parseFloat(cfg.PASS_AVG_THRESHOLD ?? PASS_AVG_THRESHOLD);
     PASS_MIN_THRESHOLD = parseFloat(cfg.PASS_MIN_THRESHOLD ?? PASS_MIN_THRESHOLD);
   } catch (e) {
-    // use defaults
+    // fallback defaults
+    RECORD_SECONDS = 60;
   }
 }
 
@@ -283,34 +319,37 @@ async function startSession() {
     resetProgressUI();
     appendMessage("Session started.");
 
-    if (data.prompt_tts_url) {
-      safeAudioPlay(API_BASE + data.prompt_tts_url);
-    }
+    if (data.prompt_tts_url) { safeAudioPlay(API_BASE + data.prompt_tts_url); }
     setDisabled(SEL.btnRetry, false);
     setDisabled(SEL.btnStart, false);
     setDisabled(SEL.btnStopSend, true);
   } catch (e) {
     appendMessage(`${STR.error} ${e?.message || e}`, "error");
+    console.error(e);
   }
 }
 
 // Session-aware fetch (avoids repeats)
 async function fetchPromptForLevel(level) {
-  const url = `${API_BASE}/prompts/${encodeURIComponent(level)}?session_id=${encodeURIComponent(SESSION_ID)}`;
-  const resp = await fetch(url);
-  const data = await resp.json();
+  try {
+    const url = `${API_BASE}/prompts/${encodeURIComponent(level)}?session_id=${encodeURIComponent(SESSION_ID)}`;
+    const resp = await fetch(url, FETCH_OPTS);
+    const data = await resp.json();
 
-  CURRENT_PROMPT = data.instructions || STR.defaultPrompt;
-  CURRENT_PROMPT_ID = typeof data.prompt_id === "number" ? data.prompt_id : null;
+    CURRENT_PROMPT = data.instructions || STR.defaultPrompt;
+    CURRENT_PROMPT_ID = typeof data.prompt_id === "number" ? data.prompt_id : null;
 
-  renderPrompt(CURRENT_PROMPT, level);
-  resetScoresUI();
-  resetProgressUI();
+    renderPrompt(CURRENT_PROMPT, level);
+    resetScoresUI();
+    resetProgressUI();
 
-  if (data.prompt_tts_url) {
-    safeAudioPlay(API_BASE + data.prompt_tts_url);
+    if (data.prompt_tts_url) { safeAudioPlay(API_BASE + data.prompt_tts_url); }
+    return CURRENT_PROMPT;
+  } catch (e) {
+    appendMessage(`Failed to fetch prompt: ${e?.message || e}`, "error");
+    console.error(e);
+    return STR.defaultPrompt;
   }
-  return CURRENT_PROMPT;
 }
 
 // Always send prompt_id or question for perfect logging
@@ -319,7 +358,8 @@ async function submitRecording(blob) {
     appendMessage(STR.processing);
     const fd = new FormData();
     fd.append("session_id", SESSION_ID);
-    fd.append("file", blob, "answer.webm");
+    // Blob type can vary by browser; backend ffmpeg handles conversion
+    fd.append("file", blob, blob && blob.type ? `answer.${blob.type.split("/")[1] || "webm"}` : "answer.webm");
 
     if (CURRENT_PROMPT_ID !== null && CURRENT_PROMPT_ID !== undefined) {
       fd.append("prompt_id", String(CURRENT_PROMPT_ID));
@@ -332,6 +372,7 @@ async function submitRecording(blob) {
 
     if (!resp.ok) {
       appendMessage(result?.detail || "Submit failed.", "error");
+      console.error("submit-response error", result);
       return;
     }
 
@@ -357,12 +398,13 @@ async function submitRecording(blob) {
     }
   } catch (e) {
     appendMessage(`${STR.error} ${e?.message || e}`, "error");
+    console.error(e);
   }
 }
 
 // Second chance at same level
 async function retrySameLevel() {
-  if (!SESSION_ID) return;
+  if (!SESSION_ID) { appendMessage("Start a session first.", "error"); return; }
   await fetchPromptForLevel(CURRENT_LEVEL);
   appendMessage(`New question for ${CURRENT_LEVEL}.`);
 }
