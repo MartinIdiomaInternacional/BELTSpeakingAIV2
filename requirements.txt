@@ -1,11 +1,6 @@
-
-fastapi>=0.111
+fastapi>=0.112
 uvicorn[standard]>=0.30
-numpy>=1.26
-soundfile>=0.12
-scipy>=1.12
-audioread>=3.0
-pydantic>=2.7
 python-multipart>=0.0.9
-prometheus-client>=0.20
-openai>=1.35.0
+starlette>=0.40
+aiofiles>=24.1.0
+openai>=1.30.0
