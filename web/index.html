@@ -1,100 +1,78 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>BELT Speaking Evaluator — Adaptive (Retry + Live Config)</title>
-    <style>
-      :root {
-        --accent: #111827;
-        --muted: #e5e7eb;
-        --ok: #16a34a;
-        --warn: #f59e0b;
-        --err: #b91c1c;
-      }
-      body { font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif; margin: 2rem; }
-      .card { border: 1px solid #ddd; border-radius: 12px; padding: 1rem 1.25rem; margin-bottom: 1rem; box-shadow: 0 2px 8px rgba(0,0,0,0.04); }
-      .row { display: flex; gap: 1rem; align-items: center; flex-wrap: wrap; }
-      .btn { padding: 0.6rem 1rem; border: none; border-radius: 10px; cursor: pointer; }
-      .btn-primary { background: var(--accent); color: white; }
-      .btn-secondary { background: var(--muted); }
-      .btn-danger { background: var(--err); color: white; }
-      .hidden { display: none; }
-      pre { background: #0b1020; color: #f3f4f6; padding: 1rem; border-radius: 8px; overflow: auto; }
-      .pill { padding: 0.25rem 0.6rem; background: #eef2ff; color: #3730a3; border-radius: 999px; font-weight: 600; }
-      audio { width: 100%; margin-top: 0.5rem; }
-      .counter { font-size: 2rem; font-weight: 700; }
-      /* Progress */
-      .progress-wrap { margin-top: .5rem; background: #f3f4f6; border-radius: 999px; height: 14px; position: relative; }
-      .progress-bar { height: 100%; width: 0%; background: linear-gradient(90deg, #60a5fa, #10b981); border-radius: 999px; transition: width .4s ease; }
-      .levels { display: flex; justify-content: space-between; font-size: .85rem; color: #374151; margin-top: .25rem; }
-      .lvl { padding: .15rem .5rem; border-radius: 999px; }
-      .lvl.passed { background: #dcfce7; color: #065f46; }
-      .lvl.current { background: #dbeafe; color: #1e40af; font-weight: 700; }
-      .lvl.locked { opacity: .6; }
-      /* Score chips */
-      .chips { display: flex; flex-wrap: wrap; gap: .5rem; }
-      .chip { padding: .35rem .55rem; border-radius: 999px; font-weight: 700; font-size: .9rem; }
-      .chip.ok { background: #dcfce7; color: #065f46; }
-      .chip.warn { background: #fef3c7; color: #92400e; }
-      .chip.err { background: #fee2e2; color: #991b1b; }
-      .chip .val { font-variant-numeric: tabular-nums; }
-      .sub { font-size: .85rem; color: #6b7280; }
-    </style>
-  </head>
-  <body>
-    <h1>BELT Speaking Evaluator — Adaptive (Retry + Live Config)</h1>
+<head>
+  <meta charset="utf-8" />
+  <title>BELT Speaking Evaluator</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <meta http-equiv="origin-trial" content="">
+  <style>
+    :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; }
+    body { margin: 0; background: #f8fafc; color: #0f172a; }
+    .wrap { max-width: 920px; margin: 24px auto; padding: 0 16px; }
+    .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 16px; margin: 16px 0; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
+    .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
+    .badges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .badge { background: #eef2ff; color: #3730a3; padding: 2px 8px; border-radius: 999px; font-weight: 600; font-size: 12px; }
+    .btn { appearance: none; border: 1px solid #0ea5e9; background: #0ea5e9; color: white; border-radius: 10px; padding: 10px 14px; cursor: pointer; font-weight: 600; }
+    .btn.secondary { background: white; color: #0ea5e9; }
+    .btn:disabled { opacity: .6; cursor: not-allowed; }
+    .prompt { font-size: 18px; line-height: 1.45; }
+    .muted { color: #64748b; }
+    .bar { height: 10px; background: #e5e7eb; border-radius: 999px; overflow: hidden; }
+    .bar span { display: block; height: 100%; width: 0%; background: #22c55e; transition: width .2s ease; }
+    .msg { font-size: 13px; padding: 6px 8px; border-radius: 8px; border: 1px solid #e5e7eb; margin: 4px 0; background: #f8fafc; }
+    .score-chip { font-size: 13px; }
+    ul { margin: 8px 0 0 20px; }
+    audio { width: 100%; margin-top: 8px; }
+    .small { font-size: 12px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>BELT Speaking Evaluator</h1>
 
     <div class="card">
       <div class="row">
-        <button id="btnStart" class="btn btn-primary">Start Adaptive Test</button>
-        <button id="btnAbort" class="btn btn-danger" disabled>Abort</button>
-        <span id="status" class="pill hidden">Idle</span>
+        <button id="btnStartSession" class="btn">Start Adaptive Test</button>
+        <button id="btnStart" class="btn secondary" disabled>Record</button>
+        <button id="btnStopSend" class="btn" disabled>Stop &amp; Send</button>
+        <button id="btnRetry" class="btn secondary" disabled>New Question (same level)</button>
+        <span class="badges">
+          <span id="levelBadge" class="badge">A1</span>
+          <span id="attemptBadge" class="badge muted">Attempt 0</span>
+        </span>
       </div>
-      <div class="row">
-        <div>Countdown: <span id="countdown" class="counter">—</span></div>
-        <div>Timer: <span id="timer" class="pill hidden">00:00</span></div>
+      <div style="margin-top:10px" class="prompt" id="promptText">Speak for ~60 seconds.</div>
+      <div class="row" style="justify-content: space-between; margin-top: 12px;">
+        <div class="bar" style="flex:1; min-width: 220px;"><span id="progressBar"></span></div>
+        <div class="muted small" id="timerText" aria-live="polite">0/60s</div>
       </div>
-      <div class="row">
-        <button id="btnStopSend" class="btn btn-secondary" disabled>⏹ Stop & Send</button>
-      </div>
-      <div class="row" style="width:100%">
-        <div style="flex:1">
-          <div class="progress-wrap"><div id="progress" class="progress-bar"></div></div>
-          <div id="levels" class="levels"></div>
-        </div>
-      </div>
+      <audio id="audioPreview" controls></audio>
     </div>
 
     <div class="card">
-      <h3>Prompt</h3>
-      <pre id="prompt">(none)</pre>
-      <div class="sub" id="attemptNote"></div>
-      <audio id="player" controls class="hidden"></audio>
+      <h3>Scores</h3>
+      <div id="scoresContainer"></div>
     </div>
 
     <div class="card">
-      <h3>Scores (per category)</h3>
-      <div id="chips" class="chips"></div>
-      <div id="avg" class="sub"></div>
+      <h3>Recommendations</h3>
+      <div id="recommendations" class="small"></div>
     </div>
 
     <div class="card">
-      <h3>Live Status</h3>
-      <pre id="live">(no activity)</pre>
+      <h3>Session</h3>
+      <div id="finalReport" class="row"></div>
+      <div>
+        <h4>Messages</h4>
+        <div id="messages"></div>
+      </div>
     </div>
 
-    <div class="card">
-      <h3>Raw Response</h3>
-      <pre id="result">(no response yet)</pre>
-    </div>
+    <p class="muted small">Tip: use headphones and a quiet room. Allow microphone permissions when prompted.</p>
+  </div>
 
-    <footer>
-      This UI pulls live thresholds from <code>/config</code>.<br/>
-      Flow: start at A1 → countdown → record (or “Stop & Send”) → backend evaluates → auto-advance on pass, single retry on fail.
-    </footer>
-
-    <!-- Use absolute path to avoid relative-path confusion -->
-    <script src="/static/main.js?v=1"></script>
-  </body>
+  <!-- Make sure this path matches your backend static mount -->
+  <script src="/static/main.js?v=2" defer></script>
+</body>
 </html>
