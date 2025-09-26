@@ -1,9 +1,10 @@
-/* BELT Voice Evaluator - Main JS (prep countdown + auto-start) */
+/* BELT Voice Evaluator - Main JS (prep countdown + auto-start + native language selector) */
 
 const API_BASE = "";
 const CONFIG_ENDPOINT = `${API_BASE}/config`;
 
 const SEL = {
+  nativeLang:"#nativeLang",
   btnStartSession:"#btnStartSession",
   btnStart:"#btnStart",
   btnStopSend:"#btnStopSend",
@@ -11,7 +12,7 @@ const SEL = {
   promptText:"#promptText",
   levelBadge:"#levelBadge",
   attemptBadge:"#attemptBadge",
-  // Prep (thinking) countdown
+  // Prep
   prepInstructions:"#prepInstructions",
   prepBar:"#prepBar",
   prepTimer:"#prepTimer",
@@ -43,6 +44,7 @@ const SCORE_COLORS = { good:"#16a34a", mid:"#f59e0b", low:"#dc2626" };
 let SESSION_ID=null, CURRENT_LEVEL="A1", CURRENT_PROMPT="", CURRENT_PROMPT_ID=null, ATTEMPT=0;
 let RECORD_SECONDS=60, PASS_AVG_THRESHOLD=0.7, PASS_MIN_THRESHOLD=0.6, DEBUG_RETURN_TRANSCRIPT=false;
 let PREP_SECONDS=30;
+let SELECTED_NATIVE_LANG="Spanish"; // default
 
 // Recorder state
 let mediaStream=null, mediaRecorder=null, recordedChunks=[], isRecording=false;
@@ -59,18 +61,17 @@ function setDisabled(s,d){ const el=$(s); if(el) el.disabled=d; }
 function appendMessage(msg,type="info"){ const el=$(SEL.messages); if(!el)return; const d=document.createElement("div"); d.className=`msg ${type}`; d.innerHTML=msg; el.prepend(d); }
 
 function safeColor(seconds){
-  if(seconds <= 5) return "#dc2626";      // red
-  if(seconds <= 15) return "#f59e0b";     // orange
-  return "#16a34a";                       // green
+  if(seconds <= 5) return "#dc2626";
+  if(seconds <= 15) return "#f59e0b";
+  return "#16a34a";
 }
 
 // ---------- Rendering ----------
 function renderPrompt(p,l){
   setText(SEL.levelBadge,l||"");
   setHTML(SEL.promptText,p||STR.defaultPrompt);
-  setHTML(SEL.prepInstructions, STR.prepMsg);
+  setHTML(SEL.prepInstructions, STR.prepMsg + ` <span class="muted">Feedback will be provided in <strong>${SELECTED_NATIVE_LANG}</strong>.</span>`);
 }
-
 function renderAttempt(n){ setText(SEL.attemptBadge, n?`Attempt ${n}`:""); }
 
 function chip(label,val){
@@ -98,7 +99,6 @@ function renderFinalReportLink(id){
   const el=$(SEL.finalReport); if(!el) return;
   el.innerHTML=`<a href="${API_BASE}/report/${encodeURIComponent(id)}" target="_blank" rel="noopener">Open Final Report</a>`;
 }
-
 function resetScoresUI(){ setHTML(SEL.scoresContainer,""); setHTML(SEL.recsContainer,""); }
 
 // ---------- Prep countdown ----------
@@ -107,22 +107,16 @@ function resetPrepUI(){
   if(bar) bar.style.width="0%";
   if(t) { t.textContent=`Prep: ${PREP_SECONDS}s`; t.style.color = safeColor(PREP_SECONDS); }
 }
-function stopPrep(){
-  if(prepInterval){ clearInterval(prepInterval); prepInterval=null; }
-  prepActive=false;
-}
+function stopPrep(){ if(prepInterval){ clearInterval(prepInterval); prepInterval=null; } prepActive=false; }
 function startPrepCountdown(){
   stopPrep();
   prepRemaining = PREP_SECONDS;
   prepActive = true;
-  // Reset UI
   resetPrepUI();
-  // Enable manual Record during prep
   setDisabled(SEL.btnStart, false);
   setDisabled(SEL.btnStopSend, true);
 
   const bar=$(SEL.prepBar), t=$(SEL.prepTimer);
-  // Initialize bar to 0 and grow to 100% over PREP_SECONDS
   let elapsed=0;
   if(bar) bar.style.width="0%";
   if(t){ t.textContent=`Prep: ${prepRemaining}s`; t.style.color=safeColor(prepRemaining); }
@@ -131,23 +125,18 @@ function startPrepCountdown(){
     if(!prepActive){ clearInterval(prepInterval); return; }
     elapsed += 1;
     prepRemaining = Math.max(0, PREP_SECONDS - elapsed);
-
-    // Update bar
     if(bar){
       const pct = Math.min(100, Math.floor((elapsed / PREP_SECONDS) * 100));
       bar.style.width = `${pct}%`;
-      // Change bar color based on remaining time too
       bar.style.background = safeColor(prepRemaining);
     }
-    // Update text
     if(t){
       t.textContent = `Prep: ${prepRemaining}s`;
       t.style.color = safeColor(prepRemaining);
     }
-
     if(prepRemaining <= 0){
       stopPrep();
-      startRecording(); // auto-start!
+      startRecording();
     }
   }, 1000);
 }
@@ -174,7 +163,6 @@ function stopTimer(){ clearInterval(timerInterval); timerInterval=null; }
 
 // ---------- Recorder ----------
 async function startRecording(){
-  // If user clicks Record during prep, cancel prep and start immediately
   if(prepActive) stopPrep();
   if(isRecording) return;
   appendMessage(STR.starting);
@@ -186,11 +174,8 @@ async function startRecording(){
     return;
   }
   recordedChunks=[];
-  try{
-    mediaRecorder=new MediaRecorder(mediaStream,{mimeType:"audio/webm;codecs=opus"});
-  }catch(e){
-    mediaRecorder=new MediaRecorder(mediaStream);
-  }
+  try{ mediaRecorder=new MediaRecorder(mediaStream,{mimeType:"audio/webm;codecs=opus"}); }
+  catch(e){ mediaRecorder=new MediaRecorder(mediaStream); }
   mediaRecorder.ondataavailable=(e)=>{ if(e.data && e.data.size>0) recordedChunks.push(e.data); };
   mediaRecorder.onstop=handleRecorderStop;
 
@@ -201,7 +186,6 @@ async function startRecording(){
   appendMessage(STR.recording);
   startTimer();
 }
-
 function handleRecorderStop(){
   stopTimer();
   if(mediaStream){ mediaStream.getTracks().forEach(t=>t.stop()); }
@@ -215,12 +199,7 @@ function handleRecorderStop(){
   const audioEl=$(SEL.audioPreview); if(audioEl){ audioEl.src=URL.createObjectURL(blob); }
   submitRecording(blob).catch(e=>appendMessage(`${STR.error} ${e?.message||e}`,"error"));
 }
-
-function stopRecordingAndSend(){
-  if(!isRecording||!mediaRecorder) return;
-  appendMessage(STR.stopped);
-  mediaRecorder.stop();
-}
+function stopRecordingAndSend(){ if(!isRecording||!mediaRecorder) return; appendMessage(STR.stopped); mediaRecorder.stop(); }
 
 // ---------- Backend integration ----------
 async function loadConfig(){
@@ -230,13 +209,17 @@ async function loadConfig(){
     PASS_AVG_THRESHOLD=parseFloat(cfg.PASS_AVG_THRESHOLD??PASS_AVG_THRESHOLD);
     PASS_MIN_THRESHOLD=parseFloat(cfg.PASS_MIN_THRESHOLD??PASS_MIN_THRESHOLD);
     DEBUG_RETURN_TRANSCRIPT=!!cfg.DEBUG_RETURN_TRANSCRIPT;
-    // Optional: support PREP_SECONDS via env in the future; for now we keep 30s default
   }catch(e){}
 }
 
 async function startSession(){
   try{
-    const fd=new FormData(); fd.append("level",CURRENT_LEVEL);
+    SELECTED_NATIVE_LANG = ($(SEL.nativeLang)?.value || "Spanish").trim() || "Spanish";
+
+    const fd=new FormData();
+    fd.append("level",CURRENT_LEVEL);
+    fd.append("native_language", SELECTED_NATIVE_LANG);
+
     const resp=await fetch(`${API_BASE}/start-session`,{method:"POST",body:fd});
     const data=await resp.json();
     SESSION_ID=data.session_id; CURRENT_LEVEL=data.level;
@@ -248,12 +231,10 @@ async function startSession(){
     renderAttempt(ATTEMPT);
     resetScoresUI(); resetProgressUI();
 
-    appendMessage("Session started. Prep time begins.");
-    // Start 30s prep countdown (auto-start recording at 0s)
+    appendMessage(`Session started. Prep time begins. Feedback language: <strong>${SELECTED_NATIVE_LANG}</strong>.`);
     startPrepCountdown();
 
     setDisabled(SEL.btnRetry,false);
-    // Keep Record enabled in case the user wants to start early
     setDisabled(SEL.btnStart,false);
     setDisabled(SEL.btnStopSend,true);
   }catch(e){ appendMessage(`${STR.error} ${e?.message||e}`,"error"); }
@@ -309,7 +290,6 @@ async function submitRecording(blob){
       appendMessage("Evaluation stopped.");
       renderFinalReportLink(SESSION_ID);
       if(result.session_recommendations){ renderRecommendations(result.session_recommendations); }
-      // Stop any prep if somehow active
       stopPrep();
     }
   }catch(e){ appendMessage(`${STR.error} ${e?.message||e}`,"error"); }
@@ -329,11 +309,14 @@ function bindUI(){
   if(r) r.addEventListener("click", startRecording);
   if(x) x.addEventListener("click", stopRecordingAndSend);
   if(q) q.addEventListener("click", retrySameLevel);
+  const nl=$(SEL.nativeLang);
+  if(nl) nl.addEventListener("change", ()=>{ SELECTED_NATIVE_LANG = nl.value; });
 }
 
 async function init(){
   bindUI();
   await loadConfig();
+  SELECTED_NATIVE_LANG = ($(SEL.nativeLang)?.value || "Spanish");
   renderPrompt(STR.defaultPrompt,CURRENT_LEVEL);
   renderAttempt(0);
   resetPrepUI();
@@ -342,5 +325,4 @@ async function init(){
   appendMessage(STR.ready);
   window.addEventListener("error",(e)=>appendMessage(`JS Error: ${e.message}`,"error"));
 }
-
 document.addEventListener("DOMContentLoaded", init);
