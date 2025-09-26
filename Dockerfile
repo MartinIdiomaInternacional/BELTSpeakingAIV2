@@ -20,14 +20,13 @@ COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
 # ---- App code ----
-# belt_service.py and the web/ directory must exist at the repo root.
 COPY belt_service.py /app/belt_service.py
 COPY web/ /app/web/
 
-# Port Render will hit; we’ll read PORT from env in start.sh
+# Expose Render port (actual port comes from $PORT)
 EXPOSE 10000
 
-# Default environment (you can override on Render)
+# Default environment (can override on Render dashboard)
 ENV ASR_BACKEND=openai \
     WHISPER_MODEL=whisper-1 \
     RUBRIC_MODEL=gpt-4o-mini \
@@ -36,7 +35,5 @@ ENV ASR_BACKEND=openai \
     RECORD_SECONDS=60
 
 # ---- Startup ----
-COPY start.sh /app/start.sh
-RUN chmod +x /app/start.sh
-
-CMD ["/app/start.sh"]
+# Run uvicorn directly, binding to the dynamic PORT provided by Render
+CMD ["sh", "-c", "uvicorn belt_service:app --host 0.0.0.0 --port ${PORT:-10000} --proxy-headers"]
