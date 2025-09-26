@@ -13,7 +13,6 @@ Features:
 """
 
 import os
-import io
 import json
 import uuid
 import time
@@ -34,7 +33,7 @@ from fastapi.staticfiles import StaticFiles
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("belt-service")
 
-app = FastAPI(title="BELT Speaking Evaluator", version="2.2")
+app = FastAPI(title="BELT Speaking Evaluator", version="2.3")
 
 app.add_middleware(
     CORSMiddleware,
@@ -60,6 +59,21 @@ RECORD_SECONDS      = int(float(os.getenv("RECORD_SECONDS", "60")))
 
 # Debug flags
 DEBUG_RETURN_TRANSCRIPT = os.getenv("DEBUG_RETURN_TRANSCRIPT", "0").strip() in ("1", "true", "True")
+
+# Log OpenAI SDK version (helps catch 0.x vs 1.x issues)
+try:
+    import openai as _oa_mod
+    _oa_ver = getattr(_oa_mod, "__version__", "unknown")
+    log.info(f"OpenAI SDK version: {_oa_ver}")
+    # Fail loudly if 0.x is installed
+    try:
+        major = int(_oa_ver.split(".")[0])
+        if major < 1:
+            raise RuntimeError(f"OpenAI SDK too old: {_oa_ver}. Please use >= 1.0.0")
+    except Exception as e:
+        log.warning(f"OpenAI SDK version check: {e}")
+except Exception:
+    log.info("OpenAI SDK not importable at startup (will try later when used)")
 
 # ---------- In-memory session store ----------
 
