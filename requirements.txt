@@ -1,6 +1,4 @@
-fastapi>=0.112
-uvicorn[standard]>=0.30
-python-multipart>=0.0.9
-starlette>=0.40
-aiofiles>=24.1.0
-openai>=1.30.0
+fastapi==0.110.0
+uvicorn[standard]==0.29.0
+python-multipart==0.0.9
+openai==1.35.10
