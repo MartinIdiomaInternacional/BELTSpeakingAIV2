@@ -1,27 +1,33 @@
-/* ===========================
-   BELT Voice Evaluator - Main JS (with Attempt badge + Recommendations)
-   ===========================
-   - Matches IDs in index.html (btnStart, btnAbort, countdown, timer, progress, etc.)
-   - Session-aware prompts (no repeats), sends prompt_id/question
-   - 3-second countdown → record up to RECORD_SECONDS (default 60)
-   - Stop & Send; Abort cancels without sending
-   - Score chips + average; level tracker; live logs
-   - TTS playback when backend provides prompt_tts_url
-   - Robust MIME fallbacks, no double-stop, explicit errors
-   - Renders backend recommendations per turn and at final stop
-*/
+# -*- coding: utf-8 -*-
+"""
+BELT Speaking Evaluator (FastAPI)
 
-// ===========================
-// CONFIG
-// ===========================
-const API_BASE = "";                         // Same-origin backend. If hosted elsewhere, set full origin.
-const CONFIG_ENDPOINT = `${API_BASE}/config`;
-const FETCH_OPTS = { cache: "no-store" };   // avoid stale config/prompts
-const CEFR_LEVELS = ["A1","A2","B1","B1+","B2","B2+","C1","C2"];
+Features:
+- 3-second countdown -> record up to RECORD_SECONDS (default 60)
+- Stop & Send / Abort
+- Robust recorder MIME fallbacks (handled client-side)
+- Session-aware prompts (no repeats), prompt_id/question logging
+- Attempt badge (1 of 2 / 2 of 2), one retry per level
+- Auto-advance on pass, final stop after second fail
+- Score chips + average + level tracker (client)
+- Tailored recommendations per turn (rule-based + AI) and session-level
+- TTS playback support for prompts (optional)
+- Static UI served from /web
+"""
 
-// ===========================
-// DOM (matches your HTML)
-// ===========================
+import os
+import io
+import json
+import math
+import uuid
+import time
+import shutil
+import logging
+import asyncio
+import tempfile
+import subprocess
+from typing import Dict, List, Any, Optional
+from collections import Counter
 const el = {
   btnStart:      document.querySelector("#btnStart"),
   btnAbort:      document.querySelector("#btnAbort"),
