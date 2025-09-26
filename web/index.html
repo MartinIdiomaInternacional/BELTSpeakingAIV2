@@ -4,7 +4,6 @@
   <meta charset="utf-8" />
   <title>BELT Speaking Evaluator</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <meta http-equiv="origin-trial" content="">
   <style>
     :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; }
     body { margin: 0; background: #f8fafc; color: #0f172a; }
@@ -42,11 +41,29 @@
           <span id="attemptBadge" class="badge muted">Attempt 0</span>
         </span>
       </div>
+
+      <!-- Prompt & Instructions -->
       <div style="margin-top:10px" class="prompt" id="promptText">Speak for ~60 seconds.</div>
-      <div class="row" style="justify-content: space-between; margin-top: 12px;">
-        <div class="bar" style="flex:1; min-width: 220px;"><span id="progressBar"></span></div>
+      <div class="small muted" id="prepInstructions" style="margin-top:6px;">
+        You have up to <strong>30 seconds</strong> to think. Recording will start automatically.
+      </div>
+
+      <!-- Prep countdown (before recording starts) -->
+      <div class="row" style="justify-content: space-between; margin-top: 10px;">
+        <div class="bar" style="flex:1; min-width: 220px;">
+          <span id="prepBar"></span>
+        </div>
+        <div id="prepTimer" class="small" aria-live="polite">Prep: 30s</div>
+      </div>
+
+      <!-- Recording progress -->
+      <div class="row" style="justify-content: space-between; margin-top: 10px;">
+        <div class="bar" style="flex:1; min-width: 220px;">
+          <span id="progressBar"></span>
+        </div>
         <div class="muted small" id="timerText" aria-live="polite">0/60s</div>
       </div>
+
       <audio id="audioPreview" controls></audio>
     </div>
 
@@ -72,7 +89,6 @@
     <p class="muted small">Tip: use headphones and a quiet room. Allow microphone permissions when prompted.</p>
   </div>
 
-  <!-- Make sure this path matches your backend static mount -->
-  <script src="/static/main.js?v=2" defer></script>
+  <script src="/static/main.js?v=3" defer></script>
 </body>
 </html>
