@@ -1,36 +1,42 @@
+# ---- Base image ----
+FROM python:3.10-slim
 
-# -------- BELT Speaking AI — One-Service (Docker) --------
-# Base image
-FROM python:3.11-slim
-
-# Environment hygiene
+# Prevent Python buffering & bytecode files in container
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PYTHONUNBUFFERED=1
 
-# System deps for audio (libsndfile for soundfile; ffmpeg useful for some inputs)
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    libsndfile1 ffmpeg \
- && rm -rf /var/lib/apt/lists/*
-
-# App directory
+# Set a working directory
 WORKDIR /app
 
-# Install Python deps first (better cache)
+# ---- System deps ----
+# ffmpeg is required to transcode browser audio to 16k mono WAV for Whisper
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    ca-certificates \
+ && rm -rf /var/lib/apt/lists/*
+
+# ---- Python deps ----
 COPY requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 
-# Copy app code (belt_service.py, add_frontend.py, web/, etc.)
-COPY . /app
+# ---- App code ----
+# belt_service.py and the web/ directory must exist at the repo root.
+COPY belt_service.py /app/belt_service.py
+COPY web/ /app/web/
 
-# Expose default port (Render will inject $PORT)
-EXPOSE 8000
+# Port Render will hit; we’ll read PORT from env in start.sh
+EXPOSE 10000
 
-# Default envs (can be overridden in Render)
-ENV PORT=8000 \
-    ASR_BACKEND=openai \
+# Default environment (you can override on Render)
+ENV ASR_BACKEND=openai \
+    WHISPER_MODEL=whisper-1 \
     RUBRIC_MODEL=gpt-4o-mini \
-    WHISPER_MODEL=whisper-1
+    PASS_AVG_THRESHOLD=0.70 \
+    PASS_MIN_THRESHOLD=0.60 \
+    RECORD_SECONDS=60
 
-# Start the service; Render provides $PORT
-CMD ["/bin/bash", "-lc", "uvicorn belt_service:app --host 0.0.0.0 --port ${PORT}"]
+# ---- Startup ----
+COPY start.sh /app/start.sh
+RUN chmod +x /app/start.sh
+
+CMD ["/app/start.sh"]
