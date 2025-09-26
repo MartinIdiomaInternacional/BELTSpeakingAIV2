@@ -24,6 +24,8 @@
     ul { margin: 8px 0 0 20px; }
     audio { width: 100%; margin-top: 8px; }
     .small { font-size: 12px; }
+    .field { display: inline-flex; align-items: center; gap: 8px; }
+    select { padding: 8px 10px; border-radius: 10px; border: 1px solid #cbd5e1; background: #fff; }
   </style>
 </head>
 <body>
@@ -31,7 +33,29 @@
     <h1>BELT Speaking Evaluator</h1>
 
     <div class="card">
+      <!-- Language selector -->
       <div class="row">
+        <div class="field">
+          <label for="nativeLang" class="small muted"><strong>Feedback language</strong> (native language):</label>
+          <select id="nativeLang">
+            <option value="Spanish" selected>Spanish (Español)</option>
+            <option value="English">English</option>
+            <option value="Portuguese">Portuguese (Português)</option>
+            <option value="French">French (Français)</option>
+            <option value="German">German (Deutsch)</option>
+            <option value="Italian">Italian (Italiano)</option>
+            <option value="Arabic">Arabic (العربية)</option>
+            <option value="Chinese (Simplified)">Chinese (简体中文)</option>
+            <option value="Chinese (Traditional)">Chinese (繁體中文)</option>
+            <option value="Japanese">Japanese (日本語)</option>
+            <option value="Korean">Korean (한국어)</option>
+            <option value="Russian">Russian (Русский)</option>
+            <option value="Hindi">Hindi (हिंदी)</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="row" style="margin-top:10px">
         <button id="btnStartSession" class="btn">Start Adaptive Test</button>
         <button id="btnStart" class="btn secondary" disabled>Record</button>
         <button id="btnStopSend" class="btn" disabled>Stop &amp; Send</button>
@@ -48,7 +72,7 @@
         You have up to <strong>30 seconds</strong> to think. Recording will start automatically.
       </div>
 
-      <!-- Prep countdown (before recording starts) -->
+      <!-- Prep countdown -->
       <div class="row" style="justify-content: space-between; margin-top: 10px;">
         <div class="bar" style="flex:1; min-width: 220px;">
           <span id="prepBar"></span>
@@ -89,6 +113,6 @@
     <p class="muted small">Tip: use headphones and a quiet room. Allow microphone permissions when prompted.</p>
   </div>
 
-  <script src="/static/main.js?v=3" defer></script>
+  <script src="/static/main.js?v=4" defer></script>
 </body>
 </html>
