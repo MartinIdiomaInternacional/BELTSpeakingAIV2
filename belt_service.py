@@ -1,15 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-BELT Speaking Evaluator (FastAPI) - Full Service with debug hooks
+BELT Speaking Evaluator (FastAPI)
 
-Features:
-- Adaptive CEFR evaluation (A1 -> C2), one retry per level
-- Session-aware prompts (no repeats), prompt_id/question logging
-- Whisper transcription (OpenAI) -> CEFR scoring (LLM + fallback)
-- Per-turn recommendations + session-level recommendations
-- Static UI served from /web
-- Health endpoints, favicon handler
-- Debug extras: logs audio size, transcript length; optional transcript echo in JSON (DEBUG_RETURN_TRANSCRIPT=1)
+- Adaptive CEFR (A1→C2), one retry per level
+- Session-aware prompts, prompt_id/question logging
+- Whisper transcription (OpenAI) → CEFR scoring (LLM + fallback)
+- Per-turn + session recommendations
+- NEW: Native-language feedback (translate recommendations with LLM)
+- Static UI from /web, health endpoints, favicon handler
 """
 
 import os
@@ -28,12 +26,10 @@ from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-# ---------- App setup ----------
-
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 log = logging.getLogger("belt-service")
 
-app = FastAPI(title="BELT Speaking Evaluator", version="2.3")
+app = FastAPI(title="BELT Speaking Evaluator", version="2.4")
 
 app.add_middleware(
     CORSMiddleware,
@@ -43,8 +39,6 @@ app.add_middleware(
 WEB_ROOT = os.path.join(os.getcwd(), "web")
 if os.path.isdir(WEB_ROOT):
     app.mount("/static", StaticFiles(directory=os.path.join(WEB_ROOT, "static")), name="static")
-
-# ---------- Config / Env ----------
 
 CEFR_ORDER = ["A1", "A2", "B1", "B1+", "B2", "B2+", "C1", "C2"]
 CEFR_CATEGORIES = ["fluency", "grammar", "vocabulary", "pronunciation", "coherence"]
@@ -56,30 +50,22 @@ RUBRIC_MODEL = os.getenv("RUBRIC_MODEL", "gpt-4o-mini").strip()
 PASS_AVG_THRESHOLD = float(os.getenv("PASS_AVG_THRESHOLD", "0.70"))
 PASS_MIN_THRESHOLD  = float(os.getenv("PASS_MIN_THRESHOLD",  "0.60"))
 RECORD_SECONDS      = int(float(os.getenv("RECORD_SECONDS", "60")))
+DEBUG_RETURN_TRANSCRIPT = os.getenv("DEBUG_RETURN_TRANSCRIPT", "0").strip() in ("1","true","True")
 
-# Debug flags
-DEBUG_RETURN_TRANSCRIPT = os.getenv("DEBUG_RETURN_TRANSCRIPT", "0").strip() in ("1", "true", "True")
-
-# Log OpenAI SDK version (helps catch 0.x vs 1.x issues)
+# Log OpenAI SDK version
 try:
-    import openai as _oa_mod
-    _oa_ver = getattr(_oa_mod, "__version__", "unknown")
-    log.info(f"OpenAI SDK version: {_oa_ver}")
-    # Fail loudly if 0.x is installed
+    import openai as _oa
+    _ver = getattr(_oa, "__version__", "unknown")
+    log.info(f"OpenAI SDK version: {_ver}")
     try:
-        major = int(_oa_ver.split(".")[0])
-        if major < 1:
-            raise RuntimeError(f"OpenAI SDK too old: {_oa_ver}. Please use >= 1.0.0")
+        if int(_ver.split(".")[0]) < 1:
+            raise RuntimeError(f"OpenAI SDK too old: {_ver}. Use >= 1.0.0")
     except Exception as e:
         log.warning(f"OpenAI SDK version check: {e}")
 except Exception:
-    log.info("OpenAI SDK not importable at startup (will try later when used)")
-
-# ---------- In-memory session store ----------
+    log.info("OpenAI SDK not importable at startup")
 
 SESSIONS: Dict[str, Dict[str, Any]] = {}
-
-# ---------- Prompts ----------
 
 def load_prompts_for_level(level: str) -> List[Dict[str, Any]]:
     path = os.path.join(WEB_ROOT, "prompts", f"{level}.json")
@@ -102,8 +88,6 @@ def load_prompts_for_level(level: str) -> List[Dict[str, Any]]:
             log.warning(f"Failed to read prompts for {level}: {e}")
     if items:
         return items
-
-    # Minimal fallback
     fallback: Dict[str, List[str]] = {
         "A1": ["Introduce yourself.", "Describe your breakfast.", "Talk about your family."],
         "A2": ["Describe your daily routine.", "Explain your last weekend plans.", "Favorite place in your town."],
@@ -127,8 +111,6 @@ def choose_prompt(level: str, session_id: str) -> Dict[str, Any]:
     first = items[0] if items else {"id": 0, "instructions": "Speak for ~60 seconds."}
     SESSIONS[session_id]["served_prompts"][level].add(first["id"])
     return first
-
-# ---------- Audio ----------
 
 def ensure_ffmpeg():
     try:
@@ -155,8 +137,6 @@ async def transcribe(openai_client, wav_path: str) -> str:
     except Exception as e:
         log.warning(f"Transcription failed: {e}")
         return ""
-
-# ---------- Scoring ----------
 
 RULEBOOK: Dict[str, List[str]] = {
     "fluency": ["Avoid long pauses.", "Shadow native clips daily.", "Use fillers naturally."],
@@ -218,7 +198,6 @@ def compute_scores(openai_client, transcript: str, level: str) -> Dict[str, Any]
         tips_ai = [t for t in (data.get("tips") or []) if isinstance(t, str) and t.strip()]
         result.update({"scores": scores, "average": avg, "tips_ai": tips_ai})
         return result
-    # crude fallback
     length = len(transcript.split())
     rough = min(1.0, length / 120.0)
     scores = {k: rough for k in CEFR_CATEGORIES}
@@ -247,7 +226,27 @@ def decision_from_scores(scores: Dict[str, float], avg: float) -> str:
         return "advance"
     return "stop"
 
-# ---------- Routes ----------
+def translate_list(openai_client, texts: List[str], target_language: str) -> List[str]:
+    """Translate a list of short feedback strings into the target language via LLM."""
+    if not texts or not target_language or openai_client is None:
+        return texts
+    try:
+        sys = "You are a precise translator. Return only the translations as a JSON array of strings, order preserved."
+        user = f"Translate each of the following strings into {target_language}. Return JSON array only.\n" + json.dumps(texts, ensure_ascii=False)
+        resp = openai_client.chat.completions.create(
+            model=RUBRIC_MODEL,
+            messages=[{"role":"system","content":sys},{"role":"user","content":user}],
+            temperature=0.0,
+            max_tokens=400
+        )
+        content = resp.choices[0].message.content.strip()
+        out = json.loads(content)
+        if isinstance(out, list) and all(isinstance(x,str) for x in out):
+            return out
+        return texts
+    except Exception as e:
+        log.warning(f"Translation failed: {e}")
+        return texts
 
 @app.get("/", response_class=HTMLResponse)
 async def index():
@@ -268,11 +267,23 @@ async def get_config():
     }
 
 @app.post("/start-session")
-async def start_session(level: str = Form("A1")):
+async def start_session(level: str = Form("A1"), native_language: str = Form("Spanish")):
     session_id = str(uuid.uuid4())
-    SESSIONS[session_id] = {"level": level, "history": [], "served_prompts": {}, "final_level": None}
+    SESSIONS[session_id] = {
+        "level": level,
+        "history": [],
+        "served_prompts": {},
+        "final_level": None,
+        "native_language": native_language.strip() or "Spanish",
+    }
     item = choose_prompt(level, session_id)
-    log.info(json.dumps({"ts": int(time.time()*1000), "msg": "start-session", "session_id": session_id, "level": level}))
+    log.info(json.dumps({
+        "ts": int(time.time()*1000),
+        "msg": "start-session",
+        "session_id": session_id,
+        "level": level,
+        "native_language": SESSIONS[session_id]["native_language"],
+    }))
     return {"session_id": session_id, "level": level, "prompt": item.get("instructions"), "prompt_id": item.get("id")}
 
 @app.get("/prompts/{level}")
@@ -291,9 +302,9 @@ async def submit_response(
     if session_id not in SESSIONS: raise HTTPException(400, "Unknown session_id")
     state = SESSIONS[session_id]
     level = state.get("level", "A1")
+    native_language = state.get("native_language", "Spanish")
     attempt = sum(1 for t in state["history"] if t.get("level") == level) + 1
 
-    # Save upload
     with tempfile.TemporaryDirectory() as td:
         src_path = os.path.join(td, file.filename or "answer.bin")
         with open(src_path, "wb") as f:
@@ -315,9 +326,7 @@ async def submit_response(
                 openai_client = None
         transcript = await transcribe(openai_client, wav_path)
 
-    # Determine used prompt text for logging
-    used_prompt_text = None
-    used_prompt_id = None
+    used_prompt_text, used_prompt_id = None, None
     if prompt_id is not None:
         try: used_prompt_id = int(prompt_id)
         except Exception: used_prompt_id = None
@@ -327,7 +336,6 @@ async def submit_response(
     if not used_prompt_text:
         used_prompt_text = question or "Speak for ~60 seconds."
 
-    # Compute scores
     pack = compute_scores(openai_client, transcript or "", level)
     scores, avg = pack["scores"], pack["average"]
     decision = decision_from_scores(scores, avg)
@@ -335,24 +343,25 @@ async def submit_response(
     if not recs:
         recs = ["Plan 3 key points before speaking.", "Link sentences with signposts (first, next, finally)."]
 
-    # Turn log
+    # Translate per-turn recommendations if needed
+    if native_language and native_language.lower() not in ("english", "en"):
+        recs = translate_list(openai_client, recs, native_language)
+
     turn = {
         "level": level, "question": used_prompt_text, "prompt_id": used_prompt_id or prompt_id,
         "transcript": transcript, "scores": scores, "average": avg, "decision": decision,
-        "attempt": attempt, "recommendations": recs,
+        "attempt": attempt, "recommendations": recs, "native_language": native_language,
     }
     state["history"].append(turn)
     if decision == "stop": state["final_level"] = level
 
-    # Debug log line
     log.info(json.dumps({
         "ts": int(time.time()*1000), "name": "belt-service", "msg": "submit-response",
         "session_id": session_id, "level": level, "attempt": attempt,
         "upload_kb": round(size_bytes/1024, 1), "transcript_len": len(transcript or ""),
-        "avg": avg, "decision": decision
+        "avg": avg, "decision": decision, "native_language": native_language
     }))
 
-    # Response payload
     payload: Dict[str, Any] = {
         "scores": scores, "average": avg, "decision": decision, "attempt": attempt, "recommendations": recs
     }
@@ -368,7 +377,10 @@ async def submit_response(
             payload.update({"next_level": nxt, "next_prompt": item.get("instructions"), "next_prompt_id": item.get("id")})
     else:
         if attempt >= 2:
-            payload["session_recommendations"] = finalize_session_recommendations(state["history"])
+            sess_recs = finalize_session_recommendations(state["history"])
+            if native_language and native_language.lower() not in ("english", "en"):
+                sess_recs = translate_list(openai_client, sess_recs, native_language)
+            payload["session_recommendations"] = sess_recs
 
     return JSONResponse(payload)
 
@@ -376,14 +388,24 @@ async def submit_response(
 async def report(session_id: str):
     if session_id not in SESSIONS: raise HTTPException(404, "Unknown session_id")
     state = SESSIONS[session_id]
+    native_language = state.get("native_language", "Spanish")
+    history = state.get("history", [])
+    sess_recs = finalize_session_recommendations(history)
+    # Translate final recs for report too
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+    except Exception:
+        client = None
+    if native_language and native_language.lower() not in ("english","en"):
+        sess_recs = translate_list(client, sess_recs, native_language)
     return {
         "session_id": session_id,
         "final_level": state.get("final_level"),
-        "history": state.get("history", []),
-        "recommendations": finalize_session_recommendations(state.get("history", [])),
+        "native_language": native_language,
+        "history": history,
+        "recommendations": sess_recs,
     }
-
-# ---------- Health & misc ----------
 
 @app.get("/healthz")
 async def healthz(): return {"ok": True}
