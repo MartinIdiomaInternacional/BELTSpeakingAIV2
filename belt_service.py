@@ -1,15 +1,15 @@
 # -*- coding: utf-8 -*-
 """
-BELT Speaking Evaluator (FastAPI)
+BELT Speaking Evaluator (FastAPI) - Full Service
 
 Features:
-- 3-second countdown -> record up to RECORD_SECONDS (default 60)
-- Stop & Send / Abort
-- Robust recorder MIME fallbacks (handled client-side)
+- 3-second countdown -> record up to RECORD_SECONDS (default 60) [client]
+- Stop & Send / Abort [client]
+- Robust recorder MIME fallbacks [client]
 - Session-aware prompts (no repeats), prompt_id/question logging
-- Attempt badge (1 of 2 / 2 of 2), one retry per level
+- Attempt badge (1 of 2 / 2 of 2), one retry per level [client/backend]
 - Auto-advance on pass, final stop after second fail
-- Score chips + average + level tracker (client)
+- Score chips + average + level tracker [client]
 - Tailored recommendations per turn (rule-based + AI) and session-level
 - TTS playback support for prompts (optional)
 - Static UI served from /web
@@ -28,486 +28,8 @@ import tempfile
 import subprocess
 from typing import Dict, List, Any, Optional
 from collections import Counter
-const el = {
-  btnStart:      document.querySelector("#btnStart"),
-  btnAbort:      document.querySelector("#btnAbort"),
-  btnStopSend:   document.querySelector("#btnStopSend"),
-  status:        document.querySelector("#status"),
-  countdown:     document.querySelector("#countdown"),
-  timer:         document.querySelector("#timer"),
-  progress:      document.querySelector("#progress"),
-  levels:        document.querySelector("#levels"),
-  prompt:        document.querySelector("#prompt"),
-  attemptNote:   document.querySelector("#attemptNote"),
-  player:        document.querySelector("#player"),
-  chips:         document.querySelector("#chips"),
-  avg:           document.querySelector("#avg"),
-  recs:          document.querySelector("#recs"),   // ← new (optional) recommendations area
-  live:          document.querySelector("#live"),
-  result:        document.querySelector("#result"),
-};
 
-// ===========================
-// App State
-// ===========================
-let SESSION_ID = null;
-let CURRENT_LEVEL = "A1";
-let CURRENT_PROMPT = "";
-let CURRENT_PROMPT_ID = null;
-let RECORD_SECONDS = 60;      // loaded from /config (min 60)
-let PASS_AVG_THRESHOLD = 0.7; // from /config
-let PASS_MIN_THRESHOLD = 0.6; // from /config
-
-// Recorder state
-let mediaStream = null;
-let mediaRecorder = null;
-let recordedChunks = [];
-let isRecording = false;
-let hasStoppedRecorder = false;
-let timerInterval = null;
-let startTimestamp = null;
-
-// ===========================
-// Global error -> show in UI
-// ===========================
-window.addEventListener("error", (e) => {
-  appendLive(`JS Error: ${e.message}`, true);
-  console.error(e.error || e.message);
-});
-window.addEventListener("unhandledrejection", (e) => {
-  appendLive(`Async Error: ${e.reason}`, true);
-  console.error(e.reason);
-});
-
-// ===========================
-// UI helpers
-// ===========================
-function show(elm) { if (elm) elm.classList.remove("hidden"); }
-function hide(elm) { if (elm) elm.classList.add("hidden"); }
-function setText(elm, txt) { if (elm) elm.textContent = txt; }
-function setHTML(elm, html) { if (elm) elm.innerHTML = html; }
-function setStatus(txt) { if (el.status) { setText(el.status, txt); show(el.status); } }
-function appendLive(msg, isErr=false) {
-  if (!el.live) return;
-  const ts = new Date().toLocaleTimeString();
-  const line = `[${ts}] ${msg}\n`;
-  el.live.textContent = line + el.live.textContent;
-  if (isErr) setStatus("Error");
-}
-function safeAudioPlay(url) { try { new Audio(url).play().catch(()=>{}); } catch(_){} }
-
-// ===========================
-// Config & Levels
-// ===========================
-async function loadConfig() {
-  try {
-    const r = await fetch(CONFIG_ENDPOINT, FETCH_OPTS);
-    const cfg = await r.json();
-    const rec = parseInt(cfg.RECORD_SECONDS ?? RECORD_SECONDS, 10);
-    RECORD_SECONDS = Number.isFinite(rec) ? Math.max(60, rec) : 60;
-    PASS_AVG_THRESHOLD = parseFloat(cfg.PASS_AVG_THRESHOLD ?? PASS_AVG_THRESHOLD);
-    PASS_MIN_THRESHOLD = parseFloat(cfg.PASS_MIN_THRESHOLD ?? PASS_MIN_THRESHOLD);
-    appendLive(`Config: RECORD_SECONDS=${RECORD_SECONDS}, PASS_AVG=${PASS_AVG_THRESHOLD}, MIN=${PASS_MIN_THRESHOLD}`);
-  } catch (e) {
-    RECORD_SECONDS = 60;
-    appendLive(`Config load failed; defaults in use. ${e}`);
-  }
-}
-function renderLevels(current) {
-  if (!el.levels) return;
-  const html = CEFR_LEVELS.map(lvl => {
-    let cls = "lvl locked";
-    if (lvl === current) cls = "lvl current";
-    if (CEFR_LEVELS.indexOf(lvl) < CEFR_LEVELS.indexOf(current)) cls = "lvl passed";
-    return `<span class="${cls}">${lvl}</span>`;
-  }).join("");
-  setHTML(el.levels, html);
-}
-
-// ===========================
-// Prompt & Scores
-// ===========================
-function renderPrompt(text, level, attemptLabel = "") {
-  if (el.prompt) setText(el.prompt, text || "(none)");
-  if (el.attemptNote) setText(el.attemptNote, attemptLabel);
-  renderLevels(level || CURRENT_LEVEL);
-}
-function renderScores(result) {
-  if (!result || !result.scores) {
-    setHTML(el.chips, "");
-    setHTML(el.avg, "");
-    renderRecommendations(null);
-    return;
-  }
-  const s = result.scores;
-  const avgPct = Math.round((result.average ?? 0) * 100);
-  const chip = (label, val) => {
-    const pct = Math.round((val ?? 0) * 100);
-    let cls = "chip err";
-    if (pct >= PASS_MIN_THRESHOLD * 100 && pct < PASS_AVG_THRESHOLD * 100) cls = "chip warn";
-    if (pct >= PASS_AVG_THRESHOLD * 100) cls = "chip ok";
-    return `<span class="${cls}">${label}: <span class="val">${pct}</span></span>`;
-  };
-  setHTML(el.chips, [
-    chip("Fluency", s.fluency),
-    chip("Grammar", s.grammar),
-    chip("Vocabulary", s.vocabulary),
-    chip("Pronunciation", s.pronunciation),
-    chip("Coherence", s.coherence),
-  ].join(" "));
-  const decision = result.decision ? ` • decision: ${result.decision}` : "";
-  const probe = result.borderline ? ` • probe` : "";
-  setText(el.avg, `Average: ${avgPct}${decision}${probe}`);
-
-  // NEW: show recommendations (per turn)
-  renderRecommendations(result);
-}
-
-// Centralized recommendations renderer
-function renderRecommendations(result) {
-  if (!el.recs) return; // HTML may not have the container yet; safe no-op
-  if (!result) { setHTML(el.recs, ""); return; }
-
-  // Accept either array of strings, or single string under common keys
-  const recArray =
-      (Array.isArray(result.recommendations) && result.recommendations)
-   || (Array.isArray(result.suggestions) && result.suggestions)
-   || (typeof result.recommendations === "string" && [result.recommendations])
-   || (typeof result.suggestions === "string" && [result.suggestions])
-   || [];
-
-  if (recArray.length === 0) { setHTML(el.recs, ""); return; }
-
-  // Simple bullet list
-  const html = `
-    <div style="margin-top: .25rem">
-      <strong>Recommendations:</strong>
-      <ul style="margin:.25rem 0 0 .9rem; padding:0;">
-        ${recArray.map(x => `<li>${escapeHtml(x)}</li>`).join("")}
-      </ul>
-    </div>
-  `;
-  setHTML(el.recs, html);
-}
-
-function escapeHtml(str) {
-  return String(str)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-// ===========================
-// Progress & Timer
-// ===========================
-function resetProgressUI() {
-  if (el.progress) el.progress.style.width = "0%";
-  setText(el.timer, "00:00");
-  hide(el.timer);
-  setText(el.countdown, "—");
-}
-function startTimer() {
-  show(el.timer);
-  startTimestamp = Date.now();
-  timerInterval = setInterval(() => {
-    const elapsed = Math.floor((Date.now() - startTimestamp) / 1000);
-    const pct = Math.min(100, Math.floor((elapsed / RECORD_SECONDS) * 100));
-    if (el.progress) el.progress.style.width = `${pct}%`;
-    const mm = String(Math.floor(elapsed / 60)).padStart(2, "0");
-    const ss = String(elapsed % 60).padStart(2, "0");
-    setText(el.timer, `${mm}:${ss}`);
-    if (elapsed >= RECORD_SECONDS) stopRecordingAndSend();
-  }, 250);
-}
-function stopTimer() {
-  if (timerInterval) clearInterval(timerInterval);
-  timerInterval = null;
-}
-
-// ===========================
-// Recorder (with fallbacks)
-// ===========================
-async function startRecording() {
-  if (isRecording) return;
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-  } catch (e) {
-    setStatus("Mic permission denied");
-    appendLive(`getUserMedia error: ${e}`, true);
-    return;
-  }
-
-  recordedChunks = [];
-  mediaRecorder = tryCreateRecorder(mediaStream, [
-    "audio/webm;codecs=opus",
-    "audio/webm",
-    "audio/ogg;codecs=opus",
-    "audio/mp4",
-    "" // default
-  ]);
-  if (!mediaRecorder) {
-    setStatus("Recorder unsupported");
-    appendLive("MediaRecorder not supported with tested MIME types.", true);
-    cleanupStream();
-    return;
-  }
-
-  mediaRecorder.ondataavailable = (e) => {
-    if (e.data && e.data.size > 0) recordedChunks.push(e.data);
-  };
-  mediaRecorder.onstop = handleRecorderStop;
-
-  hasStoppedRecorder = false;
-  mediaRecorder.start();  // continuous until stop()
-  isRecording = true;
-
-  setStatus("Recording");
-  el.btnAbort.disabled = false;
-  el.btnStopSend.disabled = false;
-  startTimer();
-  appendLive(`Recorder started (mime=${mediaRecorder.mimeType || "default"})`);
-}
-function tryCreateRecorder(stream, mimeList) {
-  for (const mt of mimeList) {
-    try {
-      if (mt && !MediaRecorder.isTypeSupported(mt)) continue;
-      return mt ? new MediaRecorder(stream, { mimeType: mt }) : new MediaRecorder(stream);
-    } catch (_) { /* try next */ }
-  }
-  return null;
-}
-function cleanupStream() {
-  try { mediaStream?.getTracks().forEach(t => t.stop()); } catch(_) {}
-  mediaStream = null;
-}
-function handleRecorderStop() {
-  stopTimer();
-  cleanupStream();
-  isRecording = false;
-  el.btnAbort.disabled = true;
-  el.btnStopSend.disabled = true;
-
-  const mime = (mediaRecorder && mediaRecorder.mimeType) ? mediaRecorder.mimeType : "audio/webm";
-  const blob = new Blob(recordedChunks, { type: mime });
-
-  if (el.player) {
-    el.player.src = URL.createObjectURL(blob);
-    show(el.player);
-  }
-
-  setStatus("Sending");
-  submitRecording(blob).catch((e) => {
-    setStatus("Error");
-    appendLive(`submitRecording error: ${e?.message || e}`, true);
-  });
-}
-function stopRecordingAndSend() {
-  if (!isRecording || !mediaRecorder) return;
-  if (hasStoppedRecorder) return;
-  hasStoppedRecorder = true;
-  try { mediaRecorder.stop(); } catch (_) {}
-}
-function abortRecording() {
-  if (!isRecording || !mediaRecorder) return;
-  hasStoppedRecorder = true;
-  try { mediaRecorder.stop(); } catch (_) {}
-  recordedChunks = []; // do NOT send
-  setStatus("Aborted");
-  appendLive("Recording aborted by user.");
-}
-
-// ===========================
-// Backend calls
-// ===========================
-async function startSession() {
-  const fd = new FormData();
-  fd.append("level", CURRENT_LEVEL);
-  const r = await fetch(`${API_BASE}/start-session`, { method: "POST", body: fd });
-  const data = await r.json();
-
-  SESSION_ID = data.session_id;
-  CURRENT_LEVEL = data.level;
-  CURRENT_PROMPT = data.prompt || data.instructions || "Speak for ~60 seconds.";
-  CURRENT_PROMPT_ID = (typeof data.prompt_id === "number") ? data.prompt_id : null;
-
-  renderPrompt(CURRENT_PROMPT, CURRENT_LEVEL, "Attempt 1 of 2");
-  resetProgressUI();
-  setStatus("Ready");
-  if (data.prompt_tts_url) safeAudioPlay(API_BASE + data.prompt_tts_url);
-
-  // Auto countdown then record
-  await countdownThenRecord();
-}
-
-async function fetchPromptForLevel(level) {
-  const url = `${API_BASE}/prompts/${encodeURIComponent(level)}?session_id=${encodeURIComponent(SESSION_ID)}`;
-  const r = await fetch(url, FETCH_OPTS);
-  const data = await r.json();
-
-  CURRENT_PROMPT = data.instructions || "Speak for ~60 seconds.";
-  CURRENT_PROMPT_ID = (typeof data.prompt_id === "number") ? data.prompt_id : null;
-
-  renderPrompt(CURRENT_PROMPT, level, "Attempt 2 of 2");
-  resetProgressUI();
-  if (data.prompt_tts_url) safeAudioPlay(API_BASE + data.prompt_tts_url);
-}
-
-async function submitRecording(blob) {
-  const fd = new FormData();
-  fd.append("session_id", SESSION_ID);
-  const ext = (blob && blob.type) ? (blob.type.split("/")[1] || "webm") : "webm";
-  fd.append("file", blob, `answer.${ext}`);
-
-  if (CURRENT_PROMPT_ID !== null && CURRENT_PROMPT_ID !== undefined) {
-    fd.append("prompt_id", String(CURRENT_PROMPT_ID));
-  } else {
-    fd.append("question", CURRENT_PROMPT);
-  }
-
-  const r = await fetch(`${API_BASE}/submit-response`, { method: "POST", body: fd });
-  const result = await r.json();
-  setHTML(el.result, JSON.stringify(result, null, 2));
-
-  // Reflect backend's attempt back into the badge
-  if (typeof result.attempt === "number" && el.attemptNote) {
-    el.attemptNote.textContent = `Attempt ${result.attempt} of 2`;
-  }
-
-  if (!r.ok) {
-    setStatus("Error");
-    appendLive(`submit-response failed: ${result?.detail || "unknown error"}`, true);
-    // still try to surface any recommendations the backend gave
-    renderRecommendations(result);
-    return;
-  }
-
-  renderScores(result);             // ← includes renderRecommendations(result)
-
-  if (result.decision === "advance" && result.next_level) {
-    CURRENT_LEVEL = result.next_level;
-
-    if (result.next_prompt) {
-      CURRENT_PROMPT = result.next_prompt;
-      CURRENT_PROMPT_ID = (typeof result.next_prompt_id === "number") ? result.next_prompt_id : null;
-      renderPrompt(CURRENT_PROMPT, CURRENT_LEVEL, "Attempt 1 of 2"); // reset for new level
-      resetScoresUI();
-      resetProgressUI();
-      // Clear recommendations from last turn until next result
-      renderRecommendations(null);
-    } else {
-      await fetchPromptForLevel(CURRENT_LEVEL);
-    }
-    setStatus(`Advanced to ${CURRENT_LEVEL}`);
-    appendLive(`Advanced to ${CURRENT_LEVEL}`);
-    await countdownThenRecord(); // smooth flow into next turn
-  } else if (result.decision === "stop") {
-    // Either first fail (retry available) or second fail (final stop)
-    if (result.attempt >= 2) {
-      setStatus("Stopped");
-      appendLive("Evaluation stopped. Open /report for details.");
-      const url = `${API_BASE}/report/${encodeURIComponent(SESSION_ID)}`;
-      setHTML(el.avg, `<a href="${url}" target="_blank" rel="noopener">Open Final Report</a>`);
-      // If backend returned session-level recommendations, show them
-      renderRecommendations(result);
-    } else {
-      setStatus("Retry available — you'll get one more question at this level (Attempt 2 of 2).`);
-      appendLive("No advance; click Start to retry with another question at this level.");
-      // Show per-turn recs right away so they can improve on retry
-      renderRecommendations(result);
-    }
-  }
-}
-
-// ===========================
-// Countdown → Record
-// ===========================
-async function countdownThenRecord() {
-  const secs = [3,2,1];
-  for (const n of secs) {
-    setText(el.countdown, String(n));
-    setStatus("Get ready");
-    await delay(700);
-  }
-  setText(el.countdown, "Go!");
-  await delay(300);
-  setText(el.countdown, "—");
-  setStatus("Recording");
-  el.btnAbort.disabled = false;
-  el.btnStopSend.disabled = false;
-  await startRecording();
-}
-function delay(ms) { return new Promise(res => setTimeout(res, ms)); }
-
-// ===========================
-// Button Handlers
-// ===========================
-async function handleStartClick() {
-  try {
-    if (!SESSION_ID) {             // first time → start session
-      await startSession();
-      return;
-    }
-    if (!isRecording) {            // retry → new prompt at same level
-      await fetchPromptForLevel(CURRENT_LEVEL);
-      await countdownThenRecord();
-      return;
-    }
-  } catch (e) {
-    setStatus("Error");
-    appendLive(`Start error: ${e?.message || e}`, true);
-  }
-}
-function handleAbortClick() { abortRecording(); }
-function handleStopSendClick() { stopRecordingAndSend(); }
-
-// ===========================
-// Reset helpers
-// ===========================
-function resetScoresUI() { setHTML(el.chips, ""); setHTML(el.avg, ""); renderRecommendations(null); }
-
-// ===========================
-// Init
-// ===========================
-async function init() {
-  el.btnStart?.addEventListener("click", handleStartClick);
-  el.btnAbort?.addEventListener("click", handleAbortClick);
-  el.btnStopSend?.addEventListener("click", handleStopSendClick);
-
-  setText(el.prompt, "(none)");
-  setText(el.countdown, "—");
-  setText(el.timer, "00:00");
-  hide(el.timer);
-  resetProgressUI();
-  setHTML(el.result, "(no response yet)");
-  setHTML(el.live, "(no activity)");
-  renderRecommendations(null);
-
-  el.btnStart.disabled = false;
-  el.btnAbort.disabled = true;
-  el.btnStopSend.disabled = true;
-
-  await loadConfig();
-  setStatus("Idle");
-  renderLevels(CURRENT_LEVEL);
-}
-document.addEventListener("DOMContentLoaded", init);
-import os
-import io
-import json
-import math
-import uuid
-import time
-import shutil
-import logging
-import asyncio
-import tempfile
-import subprocess
-from typing import Dict, List, Any, Optional
-from collections import Counter
-
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import JSONResponse, FileResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -519,22 +41,21 @@ log = logging.getLogger("belt-service")
 
 app = FastAPI(title="BELT Speaking Evaluator", version="2.0")
 
-# Allow both same-origin and separate frontends
+# Allow both same-origin and separate frontends (tighten as desired)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock down if you want specific domains
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# Serve web UI (index.html and /static/*)
+# Serve web UI (index.html + /static/*)
 WEB_ROOT = os.path.join(os.getcwd(), "web")
 if os.path.isdir(WEB_ROOT):
     app.mount("/static", StaticFiles(directory=os.path.join(WEB_ROOT, "static")), name="static")
 
-
-# ---------- Config ----------
+# ---------- Config / Env ----------
 
 CEFR_ORDER = ["A1", "A2", "B1", "B1+", "B2", "B2+", "C1", "C2"]
 
@@ -634,7 +155,7 @@ def load_prompts_for_level(level: str) -> List[Dict[str, Any]]:
 
 def choose_prompt(level: str, session_id: str) -> Dict[str, Any]:
     """
-    Session-aware random-ish prompt selection without repeats at that level.
+    Session-aware prompt selection without repeats at that level.
     """
     items = load_prompts_for_level(level)
     served = SESSIONS[session_id]["served_prompts"].setdefault(level, set())
@@ -648,7 +169,6 @@ def choose_prompt(level: str, session_id: str) -> Dict[str, Any]:
     first = items[0] if items else {"id": 0, "instructions": "Speak for ~60 seconds."}
     SESSIONS[session_id]["served_prompts"][level].add(first["id"])
     return first
-
 
 # ---------- Audio handling ----------
 
@@ -675,7 +195,7 @@ async def transcribe(openai_client, wav_path: str) -> str:
     Transcribe with OpenAI Whisper (if enabled). Fail-safe to empty string if disabled.
     """
     if ASR_BACKEND != "openai":
-        return ""  # You can implement other backends as needed
+        return ""
     if openai_client is None:
         return ""
     try:
@@ -688,13 +208,11 @@ async def transcribe(openai_client, wav_path: str) -> str:
             )
         if isinstance(resp, str):
             return resp.strip()
-        # v1 SDK returns .text for response_format="text"; keep both just in case
         text = getattr(resp, "text", "") or ""
         return text.strip()
     except Exception as e:
         log.warning(f"Transcription failed: {e}")
         return ""
-
 
 # ---------- Scoring / Recommendations ----------
 
@@ -722,7 +240,7 @@ RULEBOOK: Dict[str, List[str]] = {
         "Record yourself and compare to a native sample for 30 seconds daily."
     ],
     "coherence": [
-        "Use a simple structure: intro → 2–3 points → short wrap-up.",
+        "Use a simple structure: intro -> 2–3 points -> short wrap-up.",
         "Signpost ideas (‘firstly’, ‘on the other hand’, ‘finally’).",
         "Keep each sentence to one main idea; avoid run-ons."
     ],
@@ -805,10 +323,8 @@ def compute_scores(openai_client, transcript: str, level: str) -> Dict[str, Any]
         "tips_ai": [],
     }
     if not transcript.strip():
-        # If nothing said, everything zero
         return result
 
-    # Try LLM rubric for scores + tips
     data = try_llm_scores_and_tips(openai_client, transcript, level)
     if data and isinstance(data, dict):
         s = data.get("scores", {}) or {}
@@ -829,19 +345,6 @@ def compute_scores(openai_client, transcript: str, level: str) -> Dict[str, Any]
     result["average"] = avg
     result["tips_ai"] = []
     return result
-
-def generate_recommendations(scores: Dict[str, float], transcript: str, level: str, history: List[Dict[str, Any]]) -> List[str]:
-    rb = rule_based_tips(scores, PASS_AVG_THRESHOLD, PASS_MIN_THRESHOLD, max_tips=3)
-    ai_extra = []  # added from compute_scores() call (per-turn)
-    # We will pass AI tips separately from compute_scores
-
-    merged = dedupe_keep_order(rb + ai_extra)
-    if not merged:
-        merged = [
-            "Before speaking, jot 3 key points and 2 useful phrases for the topic.",
-            "Speak in short sentences and link them with signposts (first, next, finally).",
-        ]
-    return merged[:5]
 
 def finalize_session_recommendations(history: List[Dict[str, Any]]) -> List[str]:
     if not history:
@@ -865,7 +368,6 @@ def finalize_session_recommendations(history: List[Dict[str, Any]]) -> List[str]
     tips.append("Routine: 10 minutes daily — plan 3 points, record once, listen back, and re-record focusing on the tips above.")
     return tips[:5]
 
-
 # ---------- Helpers ----------
 
 def next_level(level: str) -> Optional[str]:
@@ -881,7 +383,6 @@ def decision_from_scores(scores: Dict[str, float], avg: float) -> str:
     if avg >= PASS_AVG_THRESHOLD and all(scores.get(k, 0.0) >= PASS_MIN_THRESHOLD for k in CEFR_CATEGORIES):
         return "advance"
     return "stop"
-
 
 # ---------- Routes ----------
 
@@ -969,7 +470,7 @@ async def submit_response(
             log.warning(f"ffmpeg convert failed: {e}")
             raise HTTPException(400, "Audio format not supported or ffmpeg error.")
 
-        # OpenAI clients are imported lazily to avoid dependency issues if keys unset
+        # OpenAI client (lazy import so service can start without key for static routes)
         openai_client = None
         if ASR_BACKEND == "openai" or RUBRIC_MODEL:
             try:
@@ -981,7 +482,7 @@ async def submit_response(
 
         transcript = await transcribe(openai_client, wav_path)
 
-    # If the UI sent prompt_id, prefer it; else fall back to provided question or last served
+    # Resolve prompt text/id for logging & consistency
     used_prompt_text = None
     used_prompt_id = None
     if prompt_id is not None:
@@ -989,28 +490,23 @@ async def submit_response(
             used_prompt_id = int(prompt_id)
         except Exception:
             used_prompt_id = None
-        # resolve text from stored served prompts if needed
         for p in load_prompts_for_level(level):
             if p["id"] == used_prompt_id:
                 used_prompt_text = p.get("instructions")
                 break
     if not used_prompt_text:
-        # If UI sent 'question', use it; else fall back to most recently served prompt for this level
         if question:
             used_prompt_text = question
         else:
-            # last served at this level
             last_served_id = None
             served = state["served_prompts"].get(level) or set()
             if served:
-                # grab a deterministic last (since we add in order)
                 last_served_id = list(served)[-1]
             if last_served_id is not None:
                 for p in load_prompts_for_level(level):
                     if p["id"] == last_served_id:
                         used_prompt_text = p.get("instructions"); used_prompt_id = last_served_id
                         break
-        # still None → generic
         used_prompt_text = used_prompt_text or "Speak for ~60 seconds."
 
     # Compute scores (LLM or heuristic)
@@ -1022,7 +518,7 @@ async def submit_response(
     # Decision
     decision = decision_from_scores(scores, avg)
 
-    # Per-turn recommendations: rule-based + (plus any AI tips we just got)
+    # Merge per-turn recommendations: rule-based + AI tips
     rb_recs = rule_based_tips(scores, PASS_AVG_THRESHOLD, PASS_MIN_THRESHOLD, max_tips=3)
     merged_recs = dedupe_keep_order(rb_recs + ai_tips)[:5]
     if not merged_recs:
@@ -1047,7 +543,7 @@ async def submit_response(
     if decision == "stop":
         state["final_level"] = level
 
-    # Build response
+    # Response
     payload: Dict[str, Any] = {
         "scores": scores,
         "average": avg,
@@ -1060,15 +556,13 @@ async def submit_response(
         nxt = next_level(level)
         if nxt:
             state["level"] = nxt
-            # For smoother UX, include the next prompt now if available
+            # Include next prompt to keep UI smooth
             item = choose_prompt(nxt, session_id)
             payload["next_level"] = nxt
             payload["next_prompt"] = item.get("instructions")
             payload["next_prompt_id"] = item.get("id")
         else:
-            # Already at top level; end
             payload["next_level"] = None
-
     else:
         # stop case: if second fail, include session-level recommendations
         if attempt >= 2:
