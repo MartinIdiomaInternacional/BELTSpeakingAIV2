@@ -1,26 +1,39 @@
-/* BELT Voice Evaluator - Main JS (prep countdown + auto-start + native language selector) */
+/* BELT Voice Evaluator - Main JS
+   v5: Adds Mic Check warm-up with live meter and /warmup-check, then adaptive test.
+*/
 
 const API_BASE = "";
 const CONFIG_ENDPOINT = `${API_BASE}/config`;
 
 const SEL = {
+  // warm-up
+  btnWarmup:"#btnWarmup",
+  liveLevel:"#liveLevel",
+  liveDb:"#liveDb",
+  warmupResult:"#warmupResult",
   nativeLang:"#nativeLang",
   btnStartSession:"#btnStartSession",
+
+  // test controls
   btnStart:"#btnStart",
   btnStopSend:"#btnStopSend",
   btnRetry:"#btnRetry",
   promptText:"#promptText",
   levelBadge:"#levelBadge",
   attemptBadge:"#attemptBadge",
-  // Prep
+
+  // prep
   prepInstructions:"#prepInstructions",
   prepBar:"#prepBar",
   prepTimer:"#prepTimer",
-  // Recording progress
+
+  // recording
   timerText:"#timerText",
   progressBar:"#progressBar",
-  // Results & misc
+
+  // results
   scoresContainer:"#scoresContainer",
+  metrics:"#metrics",
   recsContainer:"#recommendations",
   messages:"#messages",
   finalReport:"#finalReport",
@@ -52,6 +65,9 @@ let timerInterval=null, startTimestamp=null;
 
 // Prep countdown state
 let prepInterval=null, prepRemaining=0, prepActive=false;
+
+// Warm-up live meter
+let meterCtx=null, meterAnalyser=null, meterSource=null, meterRAF=null;
 
 // ---------- DOM helpers ----------
 function $(s){ return document.querySelector(s); }
@@ -88,8 +104,15 @@ function renderScores(r){
   const html=`<div>${chip("Fluency",s.fluency)}${chip("Grammar",s.grammar)}${chip("Vocabulary",s.vocabulary)}${chip("Pronunciation",s.pronunciation)}${chip("Coherence",s.coherence)}</div>
     <div style="margin-top:6px"><strong>Average:</strong> ${(avg*100).toFixed(0)}
       ${r.decision?`<span style="margin-left:8px;padding:2px 8px;border-radius:6px;background:${r.decision==='advance'?'#d1fae5':'#fee2e2'};color:${r.decision==='advance'?'#064e3b':'#7f1d1d'}">${r.decision}</span>`:""}
+      ${r.confidence!=null?`<span class="muted" style="margin-left:8px;">Confidence: ${(r.confidence*100).toFixed(0)}%</span>`:""}
     </div>`;
   setHTML(SEL.scoresContainer,html);
+  const m=$(SEL.metrics);
+  if(m){
+    const sr = r.speech_ratio==null ? "n/a" : r.speech_ratio.toFixed(2);
+    const snr = r.snr==null ? "n/a" : r.snr.toFixed(1);
+    m.textContent = `Speech ratio: ${sr}   SNR: ${snr} dB`;
+  }
 }
 function renderRecommendations(recs){
   if(!recs||!recs.length){ setHTML(SEL.recsContainer,""); return; }
@@ -99,7 +122,119 @@ function renderFinalReportLink(id){
   const el=$(SEL.finalReport); if(!el) return;
   el.innerHTML=`<a href="${API_BASE}/report/${encodeURIComponent(id)}" target="_blank" rel="noopener">Open Final Report</a>`;
 }
-function resetScoresUI(){ setHTML(SEL.scoresContainer,""); setHTML(SEL.recsContainer,""); }
+function resetScoresUI(){ setHTML(SEL.scoresContainer,""); setHTML(SEL.recsContainer,""); setHTML(SEL.metrics,""); }
+
+// ---------- Warm-up mic level ----------
+async function ensureMic(){
+  if(mediaStream) return mediaStream;
+  return await navigator.mediaDevices.getUserMedia({ audio:true });
+}
+function startLiveMeter(stream){
+  try{
+    meterCtx = new (window.AudioContext||window.webkitAudioContext)();
+    meterSource = meterCtx.createMediaStreamSource(stream);
+    meterAnalyser = meterCtx.createAnalyser();
+    meterAnalyser.fftSize = 2048;
+    meterSource.connect(meterAnalyser);
+    const data = new Uint8Array(meterAnalyser.fftSize);
+    const bar = $(SEL.liveLevel), label=$(SEL.liveDb);
+    const loop = ()=>{
+      meterRAF = requestAnimationFrame(loop);
+      meterAnalyser.getByteTimeDomainData(data);
+      // compute RMS
+      let sum=0;
+      for(let i=0;i<data.length;i++){
+        const v=(data[i]-128)/128; sum+=v*v;
+      }
+      const rms=Math.sqrt(sum/data.length); // 0..~1
+      const pct=Math.min(100, Math.max(0, Math.floor(rms*160)));
+      if(bar) bar.style.width = `${pct}%`;
+      if(label) label.textContent = `Level: ${pct}%`;
+    };
+    loop();
+  }catch(e){
+    appendMessage(`Live meter unavailable: ${e.message}`,"error");
+  }
+}
+function stopLiveMeter(){
+  if(meterRAF) cancelAnimationFrame(meterRAF);
+  meterRAF=null;
+  try{ meterCtx && meterCtx.close(); }catch(_){}
+  meterCtx=null; meterAnalyser=null; meterSource=null;
+  const bar=$(SEL.liveLevel); if(bar) bar.style.width="0%";
+  setText(SEL.liveDb, "Level: 0%");
+}
+
+async function runWarmup(){
+  setDisabled(SEL.btnWarmup,true);
+  setDisabled(SEL.btnStartSession,true);
+
+  appendMessage("Starting mic check…");
+  let stream=null;
+  try{
+    stream = await ensureMic();
+  }catch(e){
+    setHTML(SEL.warmupResult, `<div class="msg warn">Mic permission denied. Please allow microphone access.</div>`);
+    setDisabled(SEL.btnWarmup,false);
+    return;
+  }
+
+  startLiveMeter(stream);
+
+  // Record ~5 seconds
+  const durationMs = 5000;
+  const chunks=[];
+  let rec=null;
+  try{
+    rec = new MediaRecorder(stream, { mimeType:"audio/webm;codecs=opus" });
+  }catch(_){
+    rec = new MediaRecorder(stream);
+  }
+  rec.ondataavailable=(e)=>{ if(e.data && e.data.size>0) chunks.push(e.data); };
+  rec.onstop=async ()=>{
+    stopLiveMeter();
+    // stop tracks
+    try{ stream.getTracks().forEach(t=>t.stop()); }catch(_){}
+    const blob=new Blob(chunks,{type:"audio/webm"});
+    // send to /warmup-check
+    const fd=new FormData(); fd.append("file", blob, "warmup.webm");
+    let ok=false, sr=null, snr=null, note=null, thresholds=null;
+    try{
+      const resp=await fetch(`${API_BASE}/warmup-check`,{method:"POST", body:fd});
+      const data=await resp.json();
+      ok = !!data.ok;
+      sr = data.speech_ratio ?? null;
+      snr = data.snr ?? null;
+      note = data.note ?? null;
+      thresholds = data.thresholds || null;
+    }catch(e){
+      appendMessage(`Warm-up check failed: ${e.message}`,"error");
+      setDisabled(SEL.btnWarmup,false);
+      return;
+    }
+
+    const resEl=$(SEL.warmupResult);
+    const srTxt = sr==null ? "n/a" : sr.toFixed(2);
+    const snrTxt = snr==null ? "n/a" : snr.toFixed(1);
+
+    if(ok){
+      resEl.className = "msg ok";
+      resEl.innerHTML = `Mic check passed. Speech ratio: ${srTxt}, SNR: ${snrTxt} dB ${note?`(${note})`:""}. You can start the test.`;
+      setDisabled(SEL.btnStartSession,false);
+    }else{
+      const minSR = thresholds?.min_speech_ratio ?? 0.5;
+      const minSNR = thresholds?.min_snr_db ?? 15.0;
+      resEl.className = "msg warn";
+      resEl.innerHTML = `Mic check failed. Speech ratio: ${srTxt} (need >= ${minSR}), SNR: ${snrTxt} dB (need >= ${minSNR} dB). 
+      Try moving closer to the mic, reducing background noise, or increasing input volume.`;
+      setDisabled(SEL.btnStartSession,true);
+    }
+    setDisabled(SEL.btnWarmup,false);
+  };
+
+  rec.start();
+  setTimeout(()=>{ try{ rec.stop(); }catch(_){ } }, durationMs);
+}
 
 // ---------- Prep countdown ----------
 function resetPrepUI(){
@@ -110,31 +245,26 @@ function resetPrepUI(){
 function stopPrep(){ if(prepInterval){ clearInterval(prepInterval); prepInterval=null; } prepActive=false; }
 function startPrepCountdown(){
   stopPrep();
-  prepRemaining = PREP_SECONDS;
-  prepActive = true;
+  let elapsed=0;
+  prepActive=true;
   resetPrepUI();
   setDisabled(SEL.btnStart, false);
   setDisabled(SEL.btnStopSend, true);
-
   const bar=$(SEL.prepBar), t=$(SEL.prepTimer);
-  let elapsed=0;
-  if(bar) bar.style.width="0%";
-  if(t){ t.textContent=`Prep: ${prepRemaining}s`; t.style.color=safeColor(prepRemaining); }
-
   prepInterval = setInterval(()=>{
     if(!prepActive){ clearInterval(prepInterval); return; }
     elapsed += 1;
-    prepRemaining = Math.max(0, PREP_SECONDS - elapsed);
+    const remaining = Math.max(0, PREP_SECONDS - elapsed);
     if(bar){
       const pct = Math.min(100, Math.floor((elapsed / PREP_SECONDS) * 100));
       bar.style.width = `${pct}%`;
-      bar.style.background = safeColor(prepRemaining);
+      bar.style.background = safeColor(remaining);
     }
     if(t){
-      t.textContent = `Prep: ${prepRemaining}s`;
-      t.style.color = safeColor(prepRemaining);
+      t.textContent = `Prep: ${remaining}s`;
+      t.style.color = safeColor(remaining);
     }
-    if(prepRemaining <= 0){
+    if(remaining <= 0){
       stopPrep();
       startRecording();
     }
@@ -167,8 +297,7 @@ async function startRecording(){
   if(isRecording) return;
   appendMessage(STR.starting);
   try{
-    const stream = await navigator.mediaDevices.getUserMedia({ audio:true });
-    mediaStream = stream;
+    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
   }catch(e){
     appendMessage("Mic permission denied or unavailable.","error");
     return;
@@ -304,11 +433,13 @@ async function retrySameLevel(){
 
 // ---------- Wire-up ----------
 function bindUI(){
-  const s=$(SEL.btnStartSession), r=$(SEL.btnStart), x=$(SEL.btnStopSend), q=$(SEL.btnRetry);
+  const w=$(SEL.btnWarmup), s=$(SEL.btnStartSession), r=$(SEL.btnStart), x=$(SEL.btnStopSend), q=$(SEL.btnRetry);
+  if(w) w.addEventListener("click", runWarmup);
   if(s) s.addEventListener("click", startSession);
   if(r) r.addEventListener("click", startRecording);
   if(x) x.addEventListener("click", stopRecordingAndSend);
   if(q) q.addEventListener("click", retrySameLevel);
+
   const nl=$(SEL.nativeLang);
   if(nl) nl.addEventListener("change", ()=>{ SELECTED_NATIVE_LANG = nl.value; });
 }
