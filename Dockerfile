@@ -1,30 +1,40 @@
-# Use slim Python base
+# --- Base ---
 FROM python:3.10-slim
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
-    PYTHONUNBUFFERED=1
+    PYTHONUNBUFFERED=1 \
+    PORT=10000 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PIP_NO_CACHE_DIR=1
 
 WORKDIR /app
 
-# ---- System deps (ffmpeg for audio) ----
+# --- System deps ---
+# - ffmpeg for audio conversion
+# - build-essential (gcc, g++) to compile webrtcvad
+# - libsndfile1 for python-soundfile
+# - ca-certificates for TLS
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      ffmpeg \
-      ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
+    ffmpeg \
+    build-essential \
+    libsndfile1 \
+    ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
-# ---- Python deps (purge any old openai first) ----
+# --- Python deps ---
 COPY requirements.txt /app/requirements.txt
+# (Optional) cleanse old openai v0 if present in cache
 RUN python -m pip install --upgrade pip && \
     pip uninstall -y openai openai-secret-manager || true && \
     pip install --no-cache-dir -r /app/requirements.txt
 
-# ---- App code ----
+# --- App files ---
 COPY belt_service.py /app/belt_service.py
 COPY web/ /app/web/
 
-# ---- Runtime ----
-ENV PORT=10000
+# --- Health (optional) ---
 EXPOSE 10000
 
-# Uvicorn server
-CMD ["uvicorn", "belt_service:app", "--host", "0.0.0.0", "--port", "10000", "--proxy-headers", "--forwarded-allow-ips", "*"]
+# --- Start ---
+# Use uvicorn directly; no start.sh needed
+CMD ["uvicorn", "belt_service:app", "--host", "0.0.0.0", "--port", "10000", "--log-level", "info"]
