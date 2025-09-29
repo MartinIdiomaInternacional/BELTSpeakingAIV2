@@ -7,7 +7,7 @@
   <style>
     :root { font-family: system-ui, -apple-system, Segoe UI, Roboto, Inter, Arial, sans-serif; }
     body { margin: 0; background: #f8fafc; color: #0f172a; }
-    .wrap { max-width: 920px; margin: 24px auto; padding: 0 16px; }
+    .wrap { max-width: 960px; margin: 24px auto; padding: 0 16px; }
     .card { background: #fff; border: 1px solid #e5e7eb; border-radius: 14px; padding: 16px; margin: 16px 0; box-shadow: 0 1px 2px rgba(0,0,0,.04); }
     .row { display: flex; gap: 12px; flex-wrap: wrap; align-items: center; }
     .badges { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
@@ -26,14 +26,19 @@
     .small { font-size: 12px; }
     .field { display: inline-flex; align-items: center; gap: 8px; }
     select { padding: 8px 10px; border-radius: 10px; border: 1px solid #cbd5e1; background: #fff; }
+    .level-bar { height: 14px; background: #e5e7eb; border-radius: 999px; overflow: hidden; width: 240px; }
+    .level-bar span { display:block; height:100%; width:0%; background:#0ea5e9; }
+    .ok { color:#065f46; background:#d1fae5; border-color:#34d399; }
+    .warn { color:#7f1d1d; background:#fee2e2; border-color:#fca5a5; }
   </style>
 </head>
 <body>
   <div class="wrap">
     <h1>BELT Speaking Evaluator</h1>
 
-    <div class="card">
-      <!-- Language selector -->
+    <!-- Mic Check / Warm-up -->
+    <div class="card" id="cardWarmup">
+      <h3>Mic Check</h3>
       <div class="row">
         <div class="field">
           <label for="nativeLang" class="small muted"><strong>Feedback language</strong> (native language):</label>
@@ -54,9 +59,23 @@
           </select>
         </div>
       </div>
+      <p class="muted small" style="margin-top:6px;">
+        Say "Testing one two three" for about 5 seconds. We will measure your speech level and background noise.
+      </p>
+      <div class="row" style="align-items:center; gap:16px;">
+        <div class="level-bar"><span id="liveLevel"></span></div>
+        <div class="small muted" id="liveDb">Level: 0%</div>
+      </div>
+      <div class="row" style="margin-top:10px;">
+        <button id="btnWarmup" class="btn">Start Mic Check</button>
+        <button id="btnStartSession" class="btn secondary" disabled>Start Adaptive Test</button>
+      </div>
+      <div id="warmupResult" class="msg muted" style="margin-top:10px;">Mic check not run yet.</div>
+    </div>
 
-      <div class="row" style="margin-top:10px">
-        <button id="btnStartSession" class="btn">Start Adaptive Test</button>
+    <!-- Test controls -->
+    <div class="card">
+      <div class="row" style="margin-top:4px">
         <button id="btnStart" class="btn secondary" disabled>Record</button>
         <button id="btnStopSend" class="btn" disabled>Stop &amp; Send</button>
         <button id="btnRetry" class="btn secondary" disabled>New Question (same level)</button>
@@ -66,7 +85,6 @@
         </span>
       </div>
 
-      <!-- Prompt & Instructions -->
       <div style="margin-top:10px" class="prompt" id="promptText">Speak for ~60 seconds.</div>
       <div class="small muted" id="prepInstructions" style="margin-top:6px;">
         You have up to <strong>30 seconds</strong> to think. Recording will start automatically.
@@ -94,6 +112,7 @@
     <div class="card">
       <h3>Scores</h3>
       <div id="scoresContainer"></div>
+      <div id="metrics" class="small muted" style="margin-top:8px;"></div>
     </div>
 
     <div class="card">
@@ -113,6 +132,6 @@
     <p class="muted small">Tip: use headphones and a quiet room. Allow microphone permissions when prompted.</p>
   </div>
 
-  <script src="/static/main.js?v=4" defer></script>
+  <script src="/static/main.js?v=5" defer></script>
 </body>
 </html>
