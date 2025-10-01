@@ -1,24 +1,60 @@
+# Working Speaking AI Eval 2.0
 
-# BELT Speaking AI — One Service
+End-to-end demo: prep countdown + auto-record, native-language feedback, progressive probe, React frontend, FastAPI backend, Dockerized.
 
-Single FastAPI service that includes:
-- /evaluate-bytes (single-shot CEFR estimate)
-- Adaptive flow: /start-session, /submit-response, /report/{id}
-- Frontend served at / (index.html), /static, /prompts/{level}
-- Health: /healthz, /readyz; Metrics: /metrics
-
-## Run locally
+## Quick start
+```bash
+docker compose up --build
+# Web:   http://localhost:5173
+# API:   http://localhost:8000/health
 ```
-pip install -r requirements.txt
-uvicorn belt_service:app --host 0.0.0.0 --port 8000
+
+## Structure
 ```
-Open http://localhost:8000
+working-speaking-ai-eval-2.0/
+├─ backend/
+│  ├─ app/
+│  │  ├─ main.py
+│  │  ├─ models.py
+│  │  ├─ prompts.py
+│  │  ├─ scoring/
+│  │  │  ├─ __init__.py
+│  │  │  ├─ audio_features.py
+│  │  │  └─ cefr_scorer.py
+│  │  ├─ utils/
+│  │  │  ├─ decode.py
+│  │  │  ├─ language_feedback.py
+│  │  │  └─ report.py
+│  │  └─ version.py
+│  ├─ requirements.txt
+│  └─ Dockerfile
+├─ frontend/
+│  ├─ index.html
+│  ├─ src/
+│  │  ├─ main.jsx
+│  │  ├─ App.jsx
+│  │  ├─ components/
+│  │  │  ├─ Countdown.jsx
+│  │  │  ├─ Recorder.jsx
+│  │  │  ├─ WaveformCanvas.jsx
+│  │  │  └─ LanguageSelect.jsx
+│  │  ├─ lib/api.js
+│  │  └─ styles.css
+│  ├─ package.json
+│  ├─ vite.config.js
+│  └─ Dockerfile
+├─ docker-compose.yml
+├─ render.yaml
+└─ .github/workflows/ci.yml
+```
 
-## Deploy on Render
-- Build Command: `pip install -r requirements.txt`
-- Start Command: `uvicorn belt_service:app --host 0.0.0.0 --port $PORT`
-- Set env vars (see .env.example)
+## Render Deploy
+1. Create a new repo on GitHub and push this folder.
+2. In Render, **New +** → **Blueprint** → point to your repo (uses `render.yaml`).
+3. After API deploys, update the **web** service environment variable `VITE_API_BASE` to the **public URL** of the API (shown in the API service dashboard), then redeploy the web service.
 
-## Notes
-- If you want offline dev without OpenAI, set `ASR_BACKEND=none` (transcript placeholder).
-- For real scoring, set `OPENAI_API_KEY` and leave defaults.
+## CI
+GitHub Actions workflow (`.github/workflows/ci.yml`) runs:
+- Frontend: install & build
+- Backend: install deps & import-check
+- Docker: build both images

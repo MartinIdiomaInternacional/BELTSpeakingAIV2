@@ -1,26 +1,21 @@
 services:
   - type: web
-    name: BELTSpeakingAIV2
+    name: speaking-eval-api
     env: docker
-    plan: starter
+    plan: free
     autoDeploy: true
-    runtime: docker
+    dockerfilePath: backend/Dockerfile
     region: oregon
-    buildCommand: ""        # Dockerfile handles build
-    startCommand: ""        # Dockerfile CMD handles start
-    healthCheckPath: /
+    healthCheckPath: /health
+    envVars: []
+
+  - type: web
+    name: speaking-eval-web
+    env: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: frontend/Dockerfile
+    region: oregon
     envVars:
-      - key: OPENAI_API_KEY
-        sync: false         # set in the dashboard or via render CLI
-      - key: ASR_BACKEND
-        value: openai
-      - key: WHISPER_MODEL
-        value: whisper-1
-      - key: RUBRIC_MODEL
-        value: gpt-4o-mini
-      - key: PASS_AVG_THRESHOLD
-        value: "0.70"
-      - key: PASS_MIN_THRESHOLD
-        value: "0.60"
-      - key: RECORD_SECONDS
-        value: "60"
+      - key: VITE_API_BASE
+        value: "https://REPLACE_WITH_API_URL"
