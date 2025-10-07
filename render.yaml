@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: speaking-eval-api
+    env: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: backend/Dockerfile
+    region: oregon
+    healthCheckPath: /health
+    envVars: []
+
+  - type: web
+    name: speaking-eval-web
+    env: docker
+    plan: free
+    autoDeploy: true
+    dockerfilePath: frontend/Dockerfile
+    region: oregon
+    envVars:
+      - key: API_URL
+        value: "https://REPLACE_WITH_API_URL"
