@@ -22,7 +22,7 @@ def compute_basic_features(audio: np.ndarray, sr: int) -> dict:
     energies = np.array(energies) if energies else np.array([0.0])
     zcrs = np.array(zcrs) if zcrs else np.array([0.0])
 
-    voiced_ratio = float((energies > 0.001).mean()))
+    voiced_ratio = float((energies > 0.001).mean())
     avg_energy = float(energies.mean())
     avg_zcr = float(zcrs.mean())
 

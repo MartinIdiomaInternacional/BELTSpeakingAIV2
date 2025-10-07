@@ -17,5 +17,5 @@ services:
     dockerfilePath: frontend/Dockerfile
     region: oregon
     envVars:
-      - key: VITE_API_BASE
+      - key: API_URL
         value: "https://REPLACE_WITH_API_URL"
