@@ -1,18 +1,12 @@
-# Node / frontend
+
 node_modules/
 dist/
 .vite/
-
-# Python / backend
 __pycache__/
 *.pyc
 .venv/
 env/
 venv/
-
-# OS / misc
 .DS_Store
 *.log
-
-# Docker
 *.tar

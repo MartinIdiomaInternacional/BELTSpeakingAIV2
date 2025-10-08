@@ -1,6 +1,6 @@
+
 FROM python:3.11-slim
 
-# ffmpeg needed to decode webm/opus from the browser
 RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app

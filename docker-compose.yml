@@ -1,13 +1,18 @@
+
 version: "3.9"
 services:
   api:
     build: ./backend
     ports: ["8000:8000"]
+    environment:
+      - OPENAI_API_KEY
+      - DATABASE_URL
+      - QUALITY_MIN_VOICED_S=5
+      - QUALITY_MIN_SNR_DB=10
 
   web:
     build: ./frontend
     ports: ["5173:80"]
     environment:
       - API_URL=http://api:8000
-    depends_on:
-      - api
+    depends_on: [api]

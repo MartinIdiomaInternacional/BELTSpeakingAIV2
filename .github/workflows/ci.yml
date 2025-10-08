@@ -1,42 +1,32 @@
+
 name: CI
-
 on:
-  push:
-    branches: [ main, master ]
+  push: { branches: [ main, master ] }
   pull_request:
-
 jobs:
   frontend:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: frontend
+    defaults: { run: { working-directory: frontend } }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
-        with:
-          node-version: '20'
+        with: { node-version: '20' }
       - run: npm ci || npm install
       - run: npm run build
 
   backend:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: backend
+    defaults: { run: { working-directory: backend } }
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
+        with: { python-version: '3.11' }
       - run: pip install -r backend/requirements.txt
-      - run: python -c "import importlib; importlib.import_module('fastapi'); importlib.import_module('soundfile'); importlib.import_module('numpy')"
+      - run: python -c "import importlib; importlib.import_module('fastapi'); importlib.import_module('numpy'); importlib.import_module('soundfile'); importlib.import_module('sqlalchemy')"
 
   docker-build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Build backend image
-        run: docker build -t speaking-eval-backend:ci ./backend
-      - name: Build frontend image
-        run: docker build -t speaking-eval-frontend:ci ./frontend
+      - run: docker build -t speaking-eval-backend:ci ./backend
+      - run: docker build -t speaking-eval-frontend:ci ./frontend

@@ -1,6 +1,6 @@
-import { useEffect, useRef } from 'react'
 
-export default function WaveformCanvas({ stream }) {
+import { useEffect, useRef } from 'react'
+export default function WaveformCanvas({ stream }){
   const ref = useRef(null)
   useEffect(()=>{
     if(!stream) return
@@ -11,13 +11,12 @@ export default function WaveformCanvas({ stream }) {
     const data = new Uint8Array(analyser.fftSize)
     const canvas = ref.current
     const ctx = canvas.getContext('2d')
-
     function draw(){
       requestAnimationFrame(draw)
       analyser.getByteTimeDomainData(data)
       ctx.clearRect(0,0,canvas.width,canvas.height)
       ctx.beginPath()
-      const h = canvas.height, w = canvas.width
+      const h=canvas.height,w=canvas.width
       for(let i=0;i<data.length;i++){
         const x = w * i / data.length
         const y = (data[i]/255.0) * h
@@ -28,6 +27,5 @@ export default function WaveformCanvas({ stream }) {
     draw()
     return ()=>audioCtx.close()
   },[stream])
-
   return <canvas className="wave" ref={ref} width={600} height={80} />
 }

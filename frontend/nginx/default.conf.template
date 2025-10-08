@@ -1,3 +1,4 @@
+
 server {
   listen 80;
   server_name _;
@@ -5,11 +6,8 @@ server {
   root /usr/share/nginx/html;
   index index.html;
 
-  location / {
-    try_files $uri /index.html;
-  }
+  location / { try_files $uri /index.html; }
 
-  # Proxy all /api requests to the API_URL env
   location /api/ {
     proxy_pass ${API_URL}/;
     proxy_http_version 1.1;

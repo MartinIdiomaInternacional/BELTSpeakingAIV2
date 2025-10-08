@@ -1,5 +1,5 @@
-import { useEffect, useState } from 'react'
 
+import { useEffect, useState } from 'react'
 export default function Countdown({ seconds=30, onDone }) {
   const [left, setLeft] = useState(seconds)
   useEffect(()=>{
@@ -9,12 +9,10 @@ export default function Countdown({ seconds=30, onDone }) {
     }), 1000)
     return ()=>clearInterval(t)
   },[])
-
   const pct = ((seconds-left)/seconds)*100
   let color = 'var(--ok)'
   if(left<=15 && left>5) color = 'var(--warn)'
   if(left<=5) color = 'var(--danger)'
-
   return (
     <div className="card">
       <div style={{display:'flex', justifyContent:'space-between', alignItems:'baseline'}}>
@@ -24,7 +22,7 @@ export default function Countdown({ seconds=30, onDone }) {
       <div className="progress" aria-label="countdown">
         <div style={{ width: pct+'%', background: color }} />
       </div>
-      <p style={{marginTop:8}}>You have up to {seconds} seconds to think. Recording starts automatically.</p>
+      <p className="small">Recording starts automatically.</p>
     </div>
   )
 }

@@ -1,6 +1,6 @@
+
 from typing import Dict
 from .language_feedback import build_feedback
-
 HTML_TMPL = '''<!doctype html>
 <html><head><meta charset='utf-8'><title>{title}</title>
 <style>body{font-family:system-ui,Segoe UI,Arial;margin:24px;}h1{font-size:22px}h2{font-size:18px}ul{line-height:1.5}</style>
@@ -10,7 +10,6 @@ HTML_TMPL = '''<!doctype html>
 <p>{intro}</p>
 {sections}
 </body></html>'''
-
 def render_html(session_id: str, level: str, score: float, conf: float, lang: str) -> Dict:
     fb = build_feedback(level, lang)
     sect_html = "".join([

@@ -1,5 +1,5 @@
-import { useState } from 'react'
 
+import { useState } from 'react'
 export default function LanguageSelect({ onChange }) {
   const [lang, setLang] = useState('es')
   return (
@@ -8,8 +8,6 @@ export default function LanguageSelect({ onChange }) {
       <select value={lang} onChange={(e)=>{ setLang(e.target.value); onChange?.(e.target.value); }}>
         <option value="en">English</option>
         <option value="es">Español</option>
-        <option value="pt">Português</option>
-        <option value="fr">Français</option>
       </select>
     </div>
   )

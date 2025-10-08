@@ -1,3 +1,4 @@
+
 FROM node:20-alpine as build
 WORKDIR /app
 COPY frontend/package.json frontend/vite.config.js /app/

@@ -1,6 +1,7 @@
+
 {
-  "name": "speaking-eval-2.0",
-  "version": "2.0.0",
+  "name": "speaking-eval-2.2-adaptive-pro",
+  "version": "2.2.0",
   "private": true,
   "scripts": {
     "dev": "vite",
