@@ -1,4 +1,3 @@
-
 import { useState } from 'react'
 import Countdown from './components/Countdown'
 import Recorder from './components/Recorder'
@@ -9,9 +8,13 @@ import './styles.css'
 export default function App(){
   const [candidateId, setCandidateId] = useState('demo-123')
   const [nativeLang, setNativeLang] = useState('es')
+
   const [session, setSession] = useState(null)
   const [prompt, setPrompt] = useState(null)
-  const [phase, setPhase] = useState('setup') // setup -> prep -> record -> result
+
+  // setup -> prep -> record -> analyzing -> result
+  const [phase, setPhase] = useState('setup')
+
   const [autoRecord, setAutoRecord] = useState(false)
   const [lastTurn, setLastTurn] = useState(null)
   const [reportHtml, setReportHtml] = useState('')
@@ -20,22 +23,31 @@ export default function App(){
     const res = await startSession(candidateId, nativeLang)
     setSession(res.session_id)
     setPrompt(res.prompt)
+    setAutoRecord(false)
     setPhase('prep')
   }
 
-  function onPrepDone(){ setAutoRecord(true); setPhase('record') }
+  function enterRecording(){
+    setAutoRecord(true)
+    setPhase('record')
+  }
 
   async function onRecordingComplete({ base64, sampleRate }){
+    // Transition to analyzing view while backend works
+    setPhase('analyzing')
+    setAutoRecord(false)
+
     const r = await evaluateBytes(session, sampleRate, base64)
     setLastTurn(r.turn)
-    if(!r.finished){
-      setPrompt(r.next_prompt)
+
+    if (!r.finished){
+      if (r.next_prompt) setPrompt(r.next_prompt)
+      // Return to prep; user can start early or wait for countdown again
       setPhase('prep')
-      setAutoRecord(false)
     } else {
-      setPhase('result')
       const rep = await getReport(session, nativeLang)
       setReportHtml(rep.html)
+      setPhase('result')
     }
   }
 
@@ -58,12 +70,37 @@ export default function App(){
       {phase!=='setup' && prompt && (
         <div className="card">
           <h3>Prompt</h3>
-          <p>{prompt}</p>
+          <p style={{marginBottom:0}}>{prompt}</p>
         </div>
       )}
 
-      {phase==='prep' && <Countdown seconds={30} onDone={onPrepDone} />}
-      {phase==='record' && <Recorder autoStart={autoRecord} onComplete={onRecordingComplete} />}
+      {phase==='prep' && (
+        <Countdown
+          seconds={30}
+          onDone={enterRecording}
+          onStartNow={enterRecording}
+          showStartNow
+        />
+      )}
+
+      {phase==='record' && (
+        <Recorder
+          autoStart={autoRecord}
+          onComplete={onRecordingComplete}
+          // You can tweak thresholds per context:
+          minSpeakSeconds={15}
+          silenceStopSeconds={3}
+          silenceThreshold={0.012}
+          monitorFps={20}
+        />
+      )}
+
+      {phase==='analyzing' && (
+        <div className="card" role="status" aria-live="polite">
+          <h3>Analyzing your response…</h3>
+          <p className="small">This usually takes a moment.</p>
+        </div>
+      )}
 
       {lastTurn && (
         <div className="card">
