@@ -9,39 +9,32 @@ function blobToBase64(blob){
   })
 }
 
-/**
- * Auto-stop logic:
- * - Accumulate "voiced" time when frame RMS > silenceThreshold
- * - If voiced >= minSpeakSeconds AND consecutive silence >= silenceStopSeconds => stop()
- */
 export default function Recorder({
   autoStart = false,
   onComplete,
   minSpeakSeconds = 15,
   silenceStopSeconds = 3,
-  silenceThreshold = 0.012,     // ~ -38 dBFS-ish; tweak if needed
-  monitorFps = 20               // how often we sample audio for silence detection
+  silenceThreshold = 0.012,
+  monitorFps = 20
 }){
   const chunksRef = useRef([])
   const [stream, setStream] = useState(null)
   const [rec, setRec] = useState(null)
   const [recording, setRecording] = useState(false)
+  const [err, setErr] = useState('')
 
   // Audio monitoring
   const audioCtxRef = useRef(null)
-  const sourceRef = useRef(null)
   const analyserRef = useRef(null)
   const rafRef = useRef(null)
-  const voicedAccumRef = useRef(0)         // seconds of voiced speech (RMS > threshold)
-  const silenceAccumRef = useRef(0)        // seconds of continuous silence after minSpeakSeconds reached
+  const voicedAccumRef = useRef(0)
+  const silenceAccumRef = useRef(0)
   const lastTickRef = useRef(0)
 
-  useEffect(()=>{
-    navigator.mediaDevices.getUserMedia({audio:true}).then(setStream)
-  },[])
-
+  // Build a MediaRecorder only after we have a stream
   useEffect(()=>{
     if(!stream) return
+    setErr('')
     const mr = new MediaRecorder(stream, { mimeType: 'audio/webm' })
     mr.ondataavailable = (e)=>{ if(e.data?.size>0) chunksRef.current.push(e.data) }
     mr.onstop = async ()=>{
@@ -52,24 +45,48 @@ export default function Recorder({
       onComplete?.({ base64, sampleRate: 48000 })
     }
     setRec(mr)
-    // build monitor graph
+
     const ctx = new (window.AudioContext || window.webkitAudioContext)()
     const src = ctx.createMediaStreamSource(stream)
     const analyser = ctx.createAnalyser()
     analyser.fftSize = 1024
     src.connect(analyser)
     audioCtxRef.current = ctx
-    sourceRef.current = src
     analyserRef.current = analyser
     return ()=>{ try{ ctx.close() }catch{} }
   },[stream])
 
+  // If autoStart is requested and we can, start when ready (after stream exists)
   useEffect(()=>{
-    if(autoStart && rec && !recording){ start() }
-  }, [autoStart, rec])
+    if(autoStart){
+      if(rec && !recording){ start() }
+      else if(!stream){ requestStreamAndMaybeStart(true) }
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [autoStart, rec, stream])
+
+  async function requestStreamAndMaybeStart(startAfter=false){
+    try{
+      const s = await navigator.mediaDevices.getUserMedia({ audio: true })
+      setStream(s)
+      if(startAfter && rec){ start() } // if MediaRecorder already exists
+      if(startAfter && !rec){
+        // Wait a tick for rec to be created by the useEffect above
+        setTimeout(()=> start(), 0)
+      }
+    }catch(e){
+      console.error(e)
+      setErr('Microphone permission denied or unavailable. Please allow mic access and try again.')
+    }
+  }
 
   function start(){
-    if(!rec || rec.state==='recording') return
+    if(!rec){
+      // We don't have a stream yet: request it and start when ready
+      requestStreamAndMaybeStart(true)
+      return
+    }
+    if(rec.state==='recording') return
     voicedAccumRef.current = 0
     silenceAccumRef.current = 0
     lastTickRef.current = performance.now()
@@ -94,7 +111,6 @@ export default function Recorder({
     function tick(){
       rafRef.current = setTimeout(()=>{
         analyser.getFloatTimeDomainData(buf)
-        // RMS
         let sum = 0
         for(let i=0;i<buf.length;i++){ const v = buf[i]; sum += v*v }
         const rms = Math.sqrt(sum / buf.length)
@@ -131,12 +147,13 @@ export default function Recorder({
       <h3>Recording</h3>
       <WaveformCanvas stream={stream} />
       <div style={{display:'flex', gap:8, marginTop:8}}>
-        <button className="btn" onClick={start} disabled={!rec || recording}>Start</button>
-        <button className="btn" onClick={stop} disabled={!rec || !recording}>Stop</button>
+        <button className="btn" onClick={start} disabled={recording}>Start</button>
+        <button className="btn" onClick={stop} disabled={!recording}>Stop</button>
         <div className="small" style={{marginLeft:'auto'}}>
           Auto-stop after {minSpeakSeconds}s spoken + {silenceStopSeconds}s silence
         </div>
       </div>
+      {err && <div className="small" style={{color:'var(--danger)', marginTop:8}}>{err}</div>}
     </div>
   )
 }
