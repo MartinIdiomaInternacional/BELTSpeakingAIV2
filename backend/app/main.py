@@ -41,9 +41,17 @@ def root():
 def health():
     return {"status":"ok","version":VERSION}
 
-def _pick_prompt(level: str) -> str:
-    lst = PROMPTS.get(level, [])
-    return lst[0]["text"] if lst else "Please speak for 30s about your work."
+def _pick_prompt_for_level(state: dict, level: str) -> str:
+    # Rotate prompts per level to avoid repetition when staying at same level
+    cursors = state.setdefault("prompt_cursors", {})
+    cursor = cursors.get(level, 0)
+    items = PROMPTS.get(level, [])
+    if not items:
+        return "Please speak for 30s about your work."
+    prompt = items[cursor % len(items)]["text"]
+    cursors[level] = (cursor + 1) % len(items)
+    state["prompt_cursors"] = cursors
+    return prompt
 
 def _next_index(current_idx: int, inferred_idx: int, confidence: float) -> int:
     if confidence >= 0.7:
@@ -74,13 +82,18 @@ def start(req: StartRequest):
     SESSIONS[sid] = {
         "candidate_id": req.candidate_id,
         "native_language": (req.native_language or "en").lower(),
-        "state": {"idx": 0, "streak_level_idx": None, "streak_count": 0, "streak_conf_sum": 0.0, "history": []},
+        "state": {
+            "idx": 0,
+            "streak_level_idx": None, "streak_count": 0, "streak_conf_sum": 0.0,
+            "history": [],
+            "prompt_cursors": {},   # store per-level rotation cursor
+        },
         "final": None,
     }
     save_session(sid, req.candidate_id, (req.native_language or "en").lower())
     lvl = LEVELS[0]  # A1
     return StartResponse(session_id=sid, message="Session created",
-                         current_level=lvl, prompt=_pick_prompt(lvl))
+                         current_level=lvl, prompt=_pick_prompt_for_level(SESSIONS[sid]["state"], lvl))
 
 @app.post("/evaluate-bytes", response_model=EvaluateResponse)
 def evaluate_bytes(req: EvaluateBytesRequest):
@@ -129,7 +142,7 @@ def evaluate_bytes(req: EvaluateBytesRequest):
         next_idx = _next_index(asked_idx, inferred_idx, conf)
         state["idx"] = next_idx
         next_level = LEVELS[next_idx]
-        next_prompt = _pick_prompt(next_level)
+        next_prompt = _pick_prompt_for_level(state, next_level)
 
         return EvaluateResponse(
             session_id=req.session_id,
@@ -140,12 +153,14 @@ def evaluate_bytes(req: EvaluateBytesRequest):
         )
     else:
         save_turn(req.session_id, len(state["history"])+1, asked_level, None, None, None, None, False, q_reason)
+        # Even on quality fail, rotate to a *new* prompt at the same level to avoid exact repetition
+        next_prompt = _pick_prompt_for_level(state, asked_level)
         return EvaluateResponse(
             session_id=req.session_id,
             turn=TurnResult(asked_level=asked_level, quality_ok=False, quality_reason=q_reason),
             finished=False,
             next_level=asked_level,
-            next_prompt="The last recording wasn't clear enough. Please try again with less background noise and speak for at least 30 seconds."
+            next_prompt=next_prompt
         )
 
 @app.post("/report", response_model=ReportResponse)
