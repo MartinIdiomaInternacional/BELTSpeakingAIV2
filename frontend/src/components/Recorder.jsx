@@ -3,10 +3,24 @@ import WaveformCanvas from './WaveformCanvas'
 
 function blobToBase64(blob){
   return new Promise((resolve)=>{
-    const reader = new FileReader();
+    const reader = new FileReader()
     reader.onload = ()=> resolve(reader.result.split(',')[1])
     reader.readAsDataURL(blob)
   })
+}
+
+function pickMime(){
+  const prefs = [
+    'audio/webm;codecs=opus',
+    'audio/webm',
+    'audio/ogg;codecs=opus',
+    'audio/ogg',
+    'audio/mp4',            // Safari 17+
+  ]
+  for (const t of prefs){
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t
+  }
+  return '' // let browser choose
 }
 
 export default function Recorder({
@@ -15,37 +29,27 @@ export default function Recorder({
   minSpeakSeconds = 15,
   silenceStopSeconds = 3,
   silenceThreshold = 0.012,
-  monitorFps = 20
+  monitorFps = 20,
+  chunkMs = 250,            // <= IMPORTANT: periodic chunks
 }){
   const chunksRef = useRef([])
   const [stream, setStream] = useState(null)
-  const [rec, setRec] = useState(null)
+  const recRef = useRef(null)
   const [recording, setRecording] = useState(false)
   const [err, setErr] = useState('')
 
-  // Audio monitoring
+  // analysis
   const audioCtxRef = useRef(null)
   const analyserRef = useRef(null)
   const rafRef = useRef(null)
   const voicedAccumRef = useRef(0)
   const silenceAccumRef = useRef(0)
   const lastTickRef = useRef(0)
+  const doneRef = useRef(false)       // ensure onComplete fires once
 
-  // Build a MediaRecorder only after we have a stream
+  // Build analyser when stream exists
   useEffect(()=>{
     if(!stream) return
-    setErr('')
-    const mr = new MediaRecorder(stream, { mimeType: 'audio/webm' })
-    mr.ondataavailable = (e)=>{ if(e.data?.size>0) chunksRef.current.push(e.data) }
-    mr.onstop = async ()=>{
-      stopMonitor()
-      const blob = new Blob(chunksRef.current, { type: 'audio/webm' })
-      chunksRef.current = []
-      const base64 = await blobToBase64(blob)
-      onComplete?.({ base64, sampleRate: 48000 })
-    }
-    setRec(mr)
-
     const ctx = new (window.AudioContext || window.webkitAudioContext)()
     const src = ctx.createMediaStreamSource(stream)
     const analyser = ctx.createAnalyser()
@@ -54,52 +58,95 @@ export default function Recorder({
     audioCtxRef.current = ctx
     analyserRef.current = analyser
     return ()=>{ try{ ctx.close() }catch{} }
-  },[stream])
+  }, [stream])
 
-  // If autoStart is requested and we can, start when ready (after stream exists)
+  // Auto-start if requested
   useEffect(()=>{
     if(autoStart){
-      if(rec && !recording){ start() }
-      else if(!stream){ requestStreamAndMaybeStart(true) }
+      start()
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoStart, rec, stream])
+  }, [autoStart])
 
-  async function requestStreamAndMaybeStart(startAfter=false){
+  async function ensureStream(){
+    if (stream) return stream
     try{
       const s = await navigator.mediaDevices.getUserMedia({ audio: true })
       setStream(s)
-      if(startAfter && rec){ start() } // if MediaRecorder already exists
-      if(startAfter && !rec){
-        // Wait a tick for rec to be created by the useEffect above
-        setTimeout(()=> start(), 0)
-      }
+      return s
     }catch(e){
       console.error(e)
       setErr('Microphone permission denied or unavailable. Please allow mic access and try again.')
+      throw e
     }
   }
 
-  function start(){
-    if(!rec){
-      // We don't have a stream yet: request it and start when ready
-      requestStreamAndMaybeStart(true)
-      return
-    }
-    if(rec.state==='recording') return
-    voicedAccumRef.current = 0
-    silenceAccumRef.current = 0
-    lastTickRef.current = performance.now()
-    rec.start()
-    setRecording(true)
-    startMonitor()
+  async function start(){
+    try{
+      const s = await ensureStream()
+      setErr('')
+
+      // (re)create MediaRecorder every start to avoid stale handlers
+      const mimeType = pickMime()
+      const mr = new MediaRecorder(s, mimeType ? { mimeType } : {})
+      recRef.current = mr
+      chunksRef.current = []
+      doneRef.current = false
+
+      mr.ondataavailable = (e)=>{
+        if(e.data && e.data.size > 0){
+          chunksRef.current.push(e.data)
+        }
+      }
+
+      mr.onerror = (e)=> {
+        console.error('MediaRecorder error', e)
+        setErr('Recording error. Please try again.')
+      }
+
+      mr.onstop = async ()=>{
+        stopMonitor()
+        try{
+          const blob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' })
+          chunksRef.current = []
+          if (!doneRef.current){
+            doneRef.current = true
+            const base64 = await blobToBase64(blob)
+            // close tracks after we have the blob
+            try{
+              s.getTracks().forEach(t => t.stop())
+            }catch{}
+            onComplete?.({ base64, sampleRate: 48000 })
+          }
+        }catch(err2){
+          console.error(err2)
+          setErr('Could not finalize audio. Please try again.')
+        }
+      }
+
+      // reset counters & start
+      voicedAccumRef.current = 0
+      silenceAccumRef.current = 0
+      lastTickRef.current = performance.now()
+      mr.start(chunkMs)                 // <= periodic chunks
+      setRecording(true)
+      startMonitor()
+    }catch(_){}
   }
 
   function stop(){
-    if(rec && rec.state==='recording'){
-      rec.stop()
-      setRecording(false)
+    const mr = recRef.current
+    if(!mr || mr.state !== 'recording') return
+    try{
+      // flush last chunk then stop
+      mr.requestData()
+    }catch{}
+    try{
+      mr.stop()
+    }catch(e){
+      console.error(e)
     }
+    setRecording(false)
   }
 
   function startMonitor(){
@@ -108,9 +155,14 @@ export default function Recorder({
     const buf = new Float32Array(analyser.fftSize)
     const intervalMs = 1000/monitorFps
 
-    function tick(){
+    const tick = ()=>{
       rafRef.current = setTimeout(()=>{
-        analyser.getFloatTimeDomainData(buf)
+        try{
+          analyser.getFloatTimeDomainData(buf)
+        }catch{
+          // If stream closed while stopping
+          return
+        }
         let sum = 0
         for(let i=0;i<buf.length;i++){ const v = buf[i]; sum += v*v }
         const rms = Math.sqrt(sum / buf.length)
