@@ -1,9 +1,5 @@
-from typing import Optional, List
+from typing import Optional
 from pydantic import BaseModel, Field, root_validator
-
-# ─────────────────────────────────────────────────────────────
-# Request/Response Schemas
-# ─────────────────────────────────────────────────────────────
 
 # /start
 class StartRequest(BaseModel):
@@ -19,22 +15,20 @@ class StartResponse(BaseModel):
 # /evaluate-bytes
 class EvaluateBytesRequest(BaseModel):
     session_id: str
-    # Primary field for the audio payload
+    # Primary
     wav_base64: Optional[str] = Field(default=None)
-    # Backward/forward-compat aliases
+    # Aliases for backward/forward compat
     audio_base64: Optional[str] = Field(default=None)
     webm_base64: Optional[str] = Field(default=None)
     bytes_b64: Optional[str] = Field(default=None)
 
     @root_validator(pre=True)
     def coalesce_audio(cls, values):
-        # Prefer wav_base64 if present; otherwise fall back through known aliases
         for k in ["wav_base64", "audio_base64", "webm_base64", "bytes_b64"]:
             v = values.get(k)
             if v:
                 values["wav_base64"] = v
                 return values
-        # explicit error to produce a clearer 422 message
         raise ValueError("Missing audio base64 payload (wav_base64/audio_base64/webm_base64/bytes_b64)")
 
 class TurnResult(BaseModel):
@@ -45,6 +39,8 @@ class TurnResult(BaseModel):
     transcription: Optional[str] = None
     quality_ok: Optional[bool] = True
     quality_reason: Optional[str] = None
+    # New: duration of this turn's audio (seconds)
+    duration_sec: Optional[float] = None
 
 class EvaluateResponse(BaseModel):
     session_id: str
@@ -59,6 +55,9 @@ class EvaluateResponse(BaseModel):
     final_level: Optional[str] = None
     final_score_0_8: Optional[float] = None
     final_confidence: Optional[float] = None
+
+    # New: cumulative recording time (seconds) used so far
+    total_recording_sec: Optional[float] = None
 
 # /report
 class ReportRequest(BaseModel):
