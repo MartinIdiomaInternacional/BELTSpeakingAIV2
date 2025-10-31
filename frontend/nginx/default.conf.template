@@ -5,7 +5,7 @@ server {
   root /usr/share/nginx/html;
   index index.html;
 
-  # Security headers (mic allowed on this origin)
+  # Security headers + mic permission
   add_header X-Frame-Options SAMEORIGIN always;
   add_header X-Content-Type-Options nosniff always;
   add_header Referrer-Policy strict-origin-when-cross-origin always;
@@ -14,17 +14,17 @@ server {
 
   location / { try_files $uri /index.html; }
 
-  # --- API proxy to backend (HTTPS) ---
+  # API proxy to backend (HTTPS)
   location /api/ {
     proxy_pass ${API_URL}/;          # e.g. https://beltspeakingaiv2.onrender.com/
 
     proxy_http_version 1.1;
-    proxy_set_header Host $proxy_host;         # sends the backend hostname
+    proxy_set_header Host $proxy_host;         # send backend hostname
     proxy_set_header X-Real-IP $remote_addr;
     proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
     proxy_set_header X-Forwarded-Proto $scheme;
 
-    proxy_ssl_server_name on;                  # **SNI** for TLS handshake
+    proxy_ssl_server_name on;                  # SNI for TLS handshake
     proxy_redirect off;
 
     proxy_connect_timeout 5s;
