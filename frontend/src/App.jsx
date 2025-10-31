@@ -21,8 +21,28 @@ async function startSession(candidate_id, native_language){
   return api('/start', { candidate_id, native_language })
 }
 
-async function sendAudio(session_id, wav_base64){
-  return api('/evaluate-bytes', { session_id, wav_base64 })
+// --- NEW: robustness helpers for audio payload + aliasing for backward-compat
+function stripDataUrl(b64){
+  if (!b64) return b64
+  const i = b64.indexOf('base64,')
+  return i >= 0 ? b64.slice(i + 'base64,'.length) : b64
+}
+
+async function sendAudio(session_id, rawBase64){
+  const clean = stripDataUrl(rawBase64)
+
+  // lightweight sanity check to avoid empty / too-short uploads
+  if (!clean || clean.length < 5000) {
+    throw new Error('Audio capture seems empty or too short. Please try again.')
+  }
+
+  // send multiple aliases so it works with older backends too
+  return api('/evaluate-bytes', {
+    session_id,
+    wav_base64: clean,
+    audio_base64: clean,
+    webm_base64: clean,
+  })
 }
 
 function BudgetStrip({ startedAt, turnsSoFar }){
