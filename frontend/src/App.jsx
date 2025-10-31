@@ -1,134 +1,149 @@
-import { useState } from 'react'
-import Countdown from './components/Countdown'
+import { useEffect, useState } from 'react'
 import Recorder from './components/Recorder'
-import LanguageSelect from './components/LanguageSelect'
-import { startSession, evaluateBytes, getReport } from './lib/api'
-import './styles.css'
+
+const MAX_TURNS = Number(import.meta.env.VITE_MAX_TURNS || 6)
+const BUDGET_MIN = Number(import.meta.env.VITE_BUDGET_MIN || 7)
+
+async function api(path, body){
+  const res = await fetch(`/api${path}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body || {})
+  })
+  if(!res.ok){
+    const text = await res.text()
+    throw new Error(text || res.statusText)
+  }
+  return res.json()
+}
+
+async function startSession(candidate_id, native_language){
+  return api('/start', { candidate_id, native_language })
+}
+
+async function sendAudio(session_id, wav_base64){
+  return api('/evaluate-bytes', { session_id, wav_base64 })
+}
+
+function BudgetStrip({ startedAt, turnsSoFar }){
+  const [now, setNow] = useState(Date.now())
+  useEffect(()=>{
+    const id = setInterval(()=> setNow(Date.now()), 1000)
+    return ()=> clearInterval(id)
+  },[])
+  const elapsedMinFloat = startedAt ? (now - startedAt)/60000 : 0
+  const mm = Math.floor(elapsedMinFloat)
+  const ss = Math.floor((elapsedMinFloat - mm)*60).toString().padStart(2, '0')
+  return (
+    <div className="card" style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+      <div>Turn <b>{Math.min(turnsSoFar + 1, MAX_TURNS)}</b> / {MAX_TURNS}</div>
+      <div>Time: <b>{mm}:{ss}</b> / {BUDGET_MIN}m</div>
+    </div>
+  )
+}
 
 export default function App(){
-  const [candidateId, setCandidateId] = useState('demo-123')
-  const [nativeLang, setNativeLang] = useState('es')
-
-  const [session, setSession] = useState(null)
-  const [prompt, setPrompt] = useState(null)
-
-  // setup -> prep -> record -> analyzing -> result
-  const [phase, setPhase] = useState('setup')
-
-  const [autoRecord, setAutoRecord] = useState(false)
-  const [lastTurn, setLastTurn] = useState(null)
-  const [reportHtml, setReportHtml] = useState('')
+  const [sessionId, setSessionId] = useState(null)
+  const [candidateId, setCandidateId] = useState('demo-user')
+  const [nativeLang, setNativeLang] = useState('en')
+  const [prompt, setPrompt] = useState('')
+  const [currentLevel, setCurrentLevel] = useState('A1')
+  const [turnsSoFar, setTurnsSoFar] = useState(0)
+  const [startedAt, setStartedAt] = useState(null)
+  const [phase, setPhase] = useState('idle') // idle | prep | recording | analyzing | finished
+  const [final, setFinal] = useState(null)
+  const [error, setError] = useState('')
 
   async function onStart(){
-    const res = await startSession(candidateId, nativeLang)
-    setSession(res.session_id)
-    setPrompt(res.prompt)
-    setAutoRecord(false)
-    setPhase('prep')
-  }
-
-  function enterRecording(){
-    setAutoRecord(true)
-    setPhase('record')
-  }
-
-  async function onRecordingComplete({ base64, sampleRate }){
-    // Transition to analyzing view while backend works
-    setPhase('analyzing')
-    setAutoRecord(false)
-
-    const r = await evaluateBytes(session, sampleRate, base64)
-    setLastTurn(r.turn)
-
-    if (!r.finished){
-      if (r.next_prompt) setPrompt(r.next_prompt)
-      // Return to prep; user can start early or wait for countdown again
+    try{
+      setError('')
+      const res = await startSession(candidateId, nativeLang)
+      setSessionId(res.session_id)
+      setPrompt(res.prompt)
+      setCurrentLevel(res.current_level)
+      setTurnsSoFar(0)
+      setFinal(null)
+      setStartedAt(Date.now())
       setPhase('prep')
-    } else {
-      const rep = await getReport(session, nativeLang)
-      setReportHtml(rep.html)
-      setPhase('result')
+    }catch(e){
+      console.error(e)
+      setError('Could not start session. Please try again.')
+    }
+  }
+
+  async function onRecordingComplete({ base64 }){
+    if(!sessionId) return
+    try{
+      setPhase('analyzing')
+      const res = await sendAudio(sessionId, base64)
+
+      if(res.finished){
+        if(res.final_level){
+          setFinal({
+            level: res.final_level,
+            score: res.final_score_0_8,
+            confidence: res.final_confidence,
+            feedback: res.feedback,
+          })
+        }
+        setPhase('finished')
+        return
+      }
+      // Not finished: prepare next turn
+      setTurnsSoFar(t => t + 1)
+      if(res.next_level) setCurrentLevel(res.next_level)
+      if(res.next_prompt) setPrompt(res.next_prompt)
+      setPhase('prep')
+    }catch(e){
+      console.error(e)
+      setError('Upload failed. Please try again.')
+      setPhase('prep')
     }
   }
 
   return (
-    <div style={{maxWidth:860, margin:'0 auto', display:'grid', gap:12}}>
-      <h1>Working Speaking AI Eval 2.2 — Adaptive Pro</h1>
+    <div className="container">
+      <h1>BELT Speaking AI — Adaptive</h1>
+      {sessionId && <BudgetStrip startedAt={startedAt} turnsSoFar={turnsSoFar} />}
 
-      {phase==='setup' && (
+      <div className="card">
+        <label>Candidate ID</label>
+        <input value={candidateId} onChange={e=>setCandidateId(e.target.value)} />
+        <label>Native Language</label>
+        <input value={nativeLang} onChange={e=>setNativeLang(e.target.value)} placeholder="en, es, pt..." />
+        <button className="btn" onClick={onStart} disabled={!!sessionId && phase!=='finished'}>Start Session</button>
+        {error && <div className="small" style={{color:'var(--danger)', marginTop:8}}>{error}</div>}
+      </div>
+
+      {sessionId && phase !== 'finished' && (
         <div className="card">
-          <div style={{display:'grid', gap:8}}>
-            <label>Candidate ID
-              <input value={candidateId} onChange={e=>setCandidateId(e.target.value)} />
-            </label>
-            <LanguageSelect onChange={setNativeLang} />
-            <button className="btn" onClick={onStart}>Start</button>
-          </div>
+          <div className="small">Level: <b>{currentLevel}</b></div>
+          <div style={{marginTop:8}}>{prompt}</div>
         </div>
       )}
 
-      {phase!=='setup' && prompt && (
-        <div className="card">
-          <h3>Prompt</h3>
-          <p style={{marginBottom:0}}>{prompt}</p>
-        </div>
-      )}
-
-      {phase==='prep' && (
-        <Countdown
-          seconds={30}
-          onDone={enterRecording}
-          onStartNow={enterRecording}
-          showStartNow
-        />
-      )}
-
-      {phase==='record' && (
+      {sessionId && phase !== 'finished' && (
         <Recorder
-          autoStart={autoRecord}
+          autoStart={false}
           onComplete={onRecordingComplete}
-          // You can tweak thresholds per context:
           minSpeakSeconds={15}
           silenceStopSeconds={3}
           silenceThreshold={0.012}
           monitorFps={20}
+          chunkMs={250}
         />
       )}
 
-      {phase==='analyzing' && (
-        <div className="card" role="status" aria-live="polite">
-          <h3>Analyzing your response…</h3>
-          <p className="small">This usually takes a moment.</p>
-        </div>
+      {phase === 'analyzing' && (
+        <div className="card">Analyzing…</div>
       )}
 
-      {lastTurn && (
+      {phase === 'finished' && final && (
         <div className="card">
-          <h3>Last Turn</h3>
-          <div>Asked: <strong>{lastTurn.asked_level}</strong></div>
-          {!lastTurn.quality_ok && (
-            <div style={{color:'var(--danger)'}}>Quality: {lastTurn.quality_reason}</div>
-          )}
-          {lastTurn.quality_ok && (
-            <div>
-              {lastTurn.inferred_level && <div>Inferred: <strong>{lastTurn.inferred_level}</strong></div>}
-              {lastTurn.score_0_8!=null && <div>Score: {lastTurn.score_0_8.toFixed(2)} / 8</div>}
-              {lastTurn.confidence!=null && <div>Confidence: {lastTurn.confidence.toFixed(2)}</div>}
-              {lastTurn.transcription && (
-                <div style={{marginTop:8}}>
-                  <div className="label">Auto transcription (optional)</div>
-                  <div style={{whiteSpace:'pre-wrap'}}>{lastTurn.transcription}</div>
-                </div>
-              )}
-            </div>
-          )}
-        </div>
-      )}
-
-      {phase==='result' && (
-        <div className="card">
-          <h3>Final Report</h3>
-          <div dangerouslySetInnerHTML={{__html: reportHtml}} />
+          <h3>Final result</h3>
+          <div>Level: <b>{final.level}</b></div>
+          {final.score != null && <div>Score (0–8): <b>{final.score.toFixed ? final.score.toFixed(2) : final.score}</b></div>}
+          {final.confidence != null && <div>Confidence: <b>{(final.confidence*100).toFixed(0)}%</b></div>}
         </div>
       )}
     </div>
