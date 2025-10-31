@@ -1,9 +1,11 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import Recorder from './components/Recorder'
 
-const MAX_TURNS = Number(import.meta.env.VITE_MAX_TURNS || 6)
-// For UI only: show the *recording* budget, to match backend logic
-const BUDGET_MIN = Number(import.meta.env.VITE_BUDGET_MIN || 7)
+const MAX_TURNS   = Number(import.meta.env.VITE_MAX_TURNS || 6)
+// UI label for total recording budget (minutes) – matches backend MAX_RECORDING_MINUTES
+const BUDGET_MIN  = Number(import.meta.env.VITE_BUDGET_MIN || 7)
+// Per-turn thinking time (seconds) that does NOT count toward budget
+const THINK_SEC   = Number(import.meta.env.VITE_THINK_SECONDS || 30)
 
 async function api(path, body){
   const res = await fetch(`/api${path}`, {
@@ -33,6 +35,7 @@ async function sendAudio(session_id, rawBase64){
   if (!clean || clean.length < 5000) {
     throw new Error('Audio capture seems empty or too short. Please try again.')
   }
+  // Send multiple aliases for backend compatibility
   return api('/evaluate-bytes', {
     session_id,
     wav_base64: clean,
@@ -45,9 +48,20 @@ function BudgetStrip({ totalRecordingSec, turnsSoFar }){
   const mm = Math.floor(totalRecordingSec/60)
   const ss = Math.floor(totalRecordingSec - mm*60).toString().padStart(2,'0')
   return (
-    <div className="card" style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
+    <div className="card" style={{display:'flex', gap:12, alignItems:'center', justifyContent:'space-between'}}>
       <div>Turn <b>{Math.min(turnsSoFar + 1, MAX_TURNS)}</b> / {MAX_TURNS}</div>
       <div>Recording time: <b>{mm}:{ss}</b> / {BUDGET_MIN}m</div>
+    </div>
+  )
+}
+
+function ThinkStrip({ thinkLeft, onStartNow }){
+  const mm = Math.floor(thinkLeft/60)
+  const ss = Math.floor(thinkLeft - mm*60).toString().padStart(2,'0')
+  return (
+    <div className="card" style={{display:'flex', gap:12, alignItems:'center', justifyContent:'space-between'}}>
+      <div>Thinking time left: <b>{mm}:{ss}</b> / {THINK_SEC}s</div>
+      <button className="btn" onClick={onStartNow}>Start recording now</button>
     </div>
   )
 }
@@ -59,10 +73,38 @@ export default function App(){
   const [prompt, setPrompt] = useState('')
   const [currentLevel, setCurrentLevel] = useState('A1')
   const [turnsSoFar, setTurnsSoFar] = useState(0)
-  const [totalRecordingSec, setTotalRecordingSec] = useState(0) // NEW
-  const [phase, setPhase] = useState('idle') // idle | prep | recording | analyzing | finished
+  const [totalRecordingSec, setTotalRecordingSec] = useState(0)
+  const [phase, setPhase] = useState('idle') // idle | prep | recording (handled inside Recorder) | analyzing | finished
   const [final, setFinal] = useState(null)
   const [error, setError] = useState('')
+
+  // Thinking timer state
+  const [thinkLeft, setThinkLeft] = useState(THINK_SEC)
+  const thinkTimerRef = useRef(null)
+  const [startTrigger, setStartTrigger] = useState(0) // increments to trigger Recorder start
+
+  function clearThinkTimer(){
+    if (thinkTimerRef.current){
+      clearInterval(thinkTimerRef.current)
+      thinkTimerRef.current = null
+    }
+  }
+
+  function beginThinkCountdown(){
+    clearThinkTimer()
+    setThinkLeft(THINK_SEC)
+    thinkTimerRef.current = setInterval(()=>{
+      setThinkLeft(prev => {
+        const next = Math.max(0, prev - 1)
+        if (next === 0){
+          clearThinkTimer()
+          // Auto-start recording when thinking time is over
+          setStartTrigger(t => t + 1)
+        }
+        return next
+      })
+    }, 1000)
+  }
 
   async function onStart(){
     try{
@@ -75,10 +117,17 @@ export default function App(){
       setTotalRecordingSec(0)
       setFinal(null)
       setPhase('prep')
+      beginThinkCountdown()
     }catch(e){
       console.error(e)
       setError('Could not start session. Please try again.')
     }
+  }
+
+  // Manually start recording early
+  function handleStartRecordingNow(){
+    clearThinkTimer()
+    setStartTrigger(t => t + 1)
   }
 
   async function onRecordingComplete({ base64 }){
@@ -91,7 +140,6 @@ export default function App(){
       if (typeof res.total_recording_sec === 'number') {
         setTotalRecordingSec(res.total_recording_sec)
       } else if (res.turn?.duration_sec) {
-        // fallback if server didn’t send cumulative
         setTotalRecordingSec(t => t + (res.turn.duration_sec || 0))
       }
 
@@ -107,21 +155,29 @@ export default function App(){
         setPhase('finished')
         return
       }
-      // Not finished: prepare next turn
+      // Not finished: prepare next turn — reset thinking timer
       setTurnsSoFar(t => t + 1)
       if(res.next_level) setCurrentLevel(res.next_level)
       if(res.next_prompt) setPrompt(res.next_prompt)
       setPhase('prep')
+      beginThinkCountdown()
     }catch(e){
       console.error(e)
       setError('Upload failed. Please try again.')
       setPhase('prep')
+      beginThinkCountdown()
     }
   }
+
+  useEffect(()=>(){
+    // cleanup interval on unmount
+    return clearThinkTimer
+  },[])
 
   return (
     <div className="container">
       <h1>BELT Speaking AI — Adaptive</h1>
+
       {sessionId && <BudgetStrip totalRecordingSec={totalRecordingSec} turnsSoFar={turnsSoFar} />}
 
       <div className="card">
@@ -140,9 +196,14 @@ export default function App(){
         </div>
       )}
 
+      {sessionId && phase === 'prep' && (
+        <ThinkStrip thinkLeft={thinkLeft} onStartNow={handleStartRecordingNow} />
+      )}
+
       {sessionId && phase !== 'finished' && (
         <Recorder
-          autoStart={false}
+          // If startTrigger increases (auto or manual), Recorder starts
+          triggerStart={startTrigger}
           onComplete={onRecordingComplete}
           minSpeakSeconds={15}
           silenceStopSeconds={3}
