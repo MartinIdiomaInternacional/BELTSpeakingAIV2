@@ -15,12 +15,12 @@ function pickMime(){
     'audio/webm',
     'audio/ogg;codecs=opus',
     'audio/ogg',
-    'audio/mp4',            // Safari 17+
+    'audio/mp4',
   ]
   for (const t of prefs){
     if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t
   }
-  return '' // let browser choose
+  return ''
 }
 
 export default function Recorder({
@@ -30,7 +30,7 @@ export default function Recorder({
   silenceStopSeconds = 3,
   silenceThreshold = 0.012,
   monitorFps = 20,
-  chunkMs = 250,            // <= IMPORTANT: periodic chunks
+  chunkMs = 250,
 }){
   const chunksRef = useRef([])
   const [stream, setStream] = useState(null)
@@ -38,16 +38,14 @@ export default function Recorder({
   const [recording, setRecording] = useState(false)
   const [err, setErr] = useState('')
 
-  // analysis
   const audioCtxRef = useRef(null)
   const analyserRef = useRef(null)
   const rafRef = useRef(null)
   const voicedAccumRef = useRef(0)
   const silenceAccumRef = useRef(0)
   const lastTickRef = useRef(0)
-  const doneRef = useRef(false)       // ensure onComplete fires once
+  const doneRef = useRef(false)
 
-  // Build analyser when stream exists
   useEffect(()=>{
     if(!stream) return
     const ctx = new (window.AudioContext || window.webkitAudioContext)()
@@ -60,7 +58,6 @@ export default function Recorder({
     return ()=>{ try{ ctx.close() }catch{} }
   }, [stream])
 
-  // Auto-start if requested
   useEffect(()=>{
     if(autoStart){
       start()
@@ -86,7 +83,6 @@ export default function Recorder({
       const s = await ensureStream()
       setErr('')
 
-      // (re)create MediaRecorder every start to avoid stale handlers
       const mimeType = pickMime()
       const mr = new MediaRecorder(s, mimeType ? { mimeType } : {})
       recRef.current = mr
@@ -112,10 +108,7 @@ export default function Recorder({
           if (!doneRef.current){
             doneRef.current = true
             const base64 = await blobToBase64(blob)
-            // close tracks after we have the blob
-            try{
-              s.getTracks().forEach(t => t.stop())
-            }catch{}
+            try{ s.getTracks().forEach(t => t.stop()) }catch{}
             onComplete?.({ base64, sampleRate: 48000 })
           }
         }catch(err2){
@@ -124,11 +117,10 @@ export default function Recorder({
         }
       }
 
-      // reset counters & start
       voicedAccumRef.current = 0
       silenceAccumRef.current = 0
       lastTickRef.current = performance.now()
-      mr.start(chunkMs)                 // <= periodic chunks
+      mr.start(chunkMs)
       setRecording(true)
       startMonitor()
     }catch(_){}
@@ -137,15 +129,8 @@ export default function Recorder({
   function stop(){
     const mr = recRef.current
     if(!mr || mr.state !== 'recording') return
-    try{
-      // flush last chunk then stop
-      mr.requestData()
-    }catch{}
-    try{
-      mr.stop()
-    }catch(e){
-      console.error(e)
-    }
+    try{ mr.requestData() }catch{}
+    try{ mr.stop() }catch(e){ console.error(e) }
     setRecording(false)
   }
 
@@ -157,12 +142,7 @@ export default function Recorder({
 
     const tick = ()=>{
       rafRef.current = setTimeout(()=>{
-        try{
-          analyser.getFloatTimeDomainData(buf)
-        }catch{
-          // If stream closed while stopping
-          return
-        }
+        try{ analyser.getFloatTimeDomainData(buf) }catch{ return }
         let sum = 0
         for(let i=0;i<buf.length;i++){ const v = buf[i]; sum += v*v }
         const rms = Math.sqrt(sum / buf.length)
