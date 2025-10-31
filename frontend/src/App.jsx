@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import Recorder from './components/Recorder'
 
 const MAX_TURNS = Number(import.meta.env.VITE_MAX_TURNS || 6)
+// For UI only: show the *recording* budget, to match backend logic
 const BUDGET_MIN = Number(import.meta.env.VITE_BUDGET_MIN || 7)
 
 async function api(path, body){
@@ -21,7 +22,6 @@ async function startSession(candidate_id, native_language){
   return api('/start', { candidate_id, native_language })
 }
 
-// --- NEW: robustness helpers for audio payload + aliasing for backward-compat
 function stripDataUrl(b64){
   if (!b64) return b64
   const i = b64.indexOf('base64,')
@@ -30,13 +30,9 @@ function stripDataUrl(b64){
 
 async function sendAudio(session_id, rawBase64){
   const clean = stripDataUrl(rawBase64)
-
-  // lightweight sanity check to avoid empty / too-short uploads
   if (!clean || clean.length < 5000) {
     throw new Error('Audio capture seems empty or too short. Please try again.')
   }
-
-  // send multiple aliases so it works with older backends too
   return api('/evaluate-bytes', {
     session_id,
     wav_base64: clean,
@@ -45,19 +41,13 @@ async function sendAudio(session_id, rawBase64){
   })
 }
 
-function BudgetStrip({ startedAt, turnsSoFar }){
-  const [now, setNow] = useState(Date.now())
-  useEffect(()=>{
-    const id = setInterval(()=> setNow(Date.now()), 1000)
-    return ()=> clearInterval(id)
-  },[])
-  const elapsedMinFloat = startedAt ? (now - startedAt)/60000 : 0
-  const mm = Math.floor(elapsedMinFloat)
-  const ss = Math.floor((elapsedMinFloat - mm)*60).toString().padStart(2, '0')
+function BudgetStrip({ totalRecordingSec, turnsSoFar }){
+  const mm = Math.floor(totalRecordingSec/60)
+  const ss = Math.floor(totalRecordingSec - mm*60).toString().padStart(2,'0')
   return (
     <div className="card" style={{display:'flex', justifyContent:'space-between', alignItems:'center'}}>
       <div>Turn <b>{Math.min(turnsSoFar + 1, MAX_TURNS)}</b> / {MAX_TURNS}</div>
-      <div>Time: <b>{mm}:{ss}</b> / {BUDGET_MIN}m</div>
+      <div>Recording time: <b>{mm}:{ss}</b> / {BUDGET_MIN}m</div>
     </div>
   )
 }
@@ -69,7 +59,7 @@ export default function App(){
   const [prompt, setPrompt] = useState('')
   const [currentLevel, setCurrentLevel] = useState('A1')
   const [turnsSoFar, setTurnsSoFar] = useState(0)
-  const [startedAt, setStartedAt] = useState(null)
+  const [totalRecordingSec, setTotalRecordingSec] = useState(0) // NEW
   const [phase, setPhase] = useState('idle') // idle | prep | recording | analyzing | finished
   const [final, setFinal] = useState(null)
   const [error, setError] = useState('')
@@ -82,8 +72,8 @@ export default function App(){
       setPrompt(res.prompt)
       setCurrentLevel(res.current_level)
       setTurnsSoFar(0)
+      setTotalRecordingSec(0)
       setFinal(null)
-      setStartedAt(Date.now())
       setPhase('prep')
     }catch(e){
       console.error(e)
@@ -96,6 +86,14 @@ export default function App(){
     try{
       setPhase('analyzing')
       const res = await sendAudio(sessionId, base64)
+
+      // Update cumulative recording-time from server truth
+      if (typeof res.total_recording_sec === 'number') {
+        setTotalRecordingSec(res.total_recording_sec)
+      } else if (res.turn?.duration_sec) {
+        // fallback if server didn’t send cumulative
+        setTotalRecordingSec(t => t + (res.turn.duration_sec || 0))
+      }
 
       if(res.finished){
         if(res.final_level){
@@ -124,7 +122,7 @@ export default function App(){
   return (
     <div className="container">
       <h1>BELT Speaking AI — Adaptive</h1>
-      {sessionId && <BudgetStrip startedAt={startedAt} turnsSoFar={turnsSoFar} />}
+      {sessionId && <BudgetStrip totalRecordingSec={totalRecordingSec} turnsSoFar={turnsSoFar} />}
 
       <div className="card">
         <label>Candidate ID</label>
