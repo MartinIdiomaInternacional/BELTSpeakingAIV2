@@ -32,7 +32,6 @@ async function sendAudio(session_id, rawBase64){
   if (!clean || clean.length < 5000) {
     throw new Error('Audio seems empty/too short. Please try again.')
   }
-  // multiple aliases for backend compatibility
   return api('/evaluate-bytes', {
     session_id,
     wav_base64: clean,
@@ -57,7 +56,6 @@ function ProgressBar({ value, max, height=8, label }){
 }
 
 function Ding(){
-  // a tiny sine “ding” using WebAudio
   function play(){
     try{
       const ctx = new (window.AudioContext||window.webkitAudioContext)()
@@ -88,7 +86,7 @@ function BudgetStrip({ totalRecordingSec, turnsSoFar }){
   )
 }
 
-// ---- Recorder (embedded here to keep file count small) ----
+// ---- Recorder & waveform ----
 function WaveformCanvas({ stream }){
   const ref = useRef(null)
   const raf = useRef(0)
@@ -132,6 +130,8 @@ function WaveformCanvas({ stream }){
 
 function Recorder({
   triggerStart = 0,
+  onStarted,           // NEW
+  onStopped,           // NEW (optional)
   onComplete,
   minSpeakSeconds = 15,
   silenceStopSeconds = 3,
@@ -236,6 +236,7 @@ function Recorder({
         chunksRef.current = []
         const base64 = await blobToBase64(blob)
         try{ s.getTracks().forEach(t=>t.stop()) }catch{}
+        onStopped?.()        // NEW
         onComplete?.({ base64 })
       }catch(err2){
         console.error(err2)
@@ -246,6 +247,7 @@ function Recorder({
     lastTickRef.current = performance.now()
     mr.start(chunkMs)
     setRecording(true)
+    onStarted?.()          // NEW — tells parent to stop the thinking timer
     startMonitor()
   }
 
@@ -311,7 +313,7 @@ export default function App(){
   const [turnsSoFar, setTurnsSoFar] = useState(0)
 
   const [totalRecordingSec, setTotalRecordingSec] = useState(0)
-  const [phase, setPhase] = useState('idle') // idle | prep | analyzing | finished
+  const [phase, setPhase] = useState('idle') // idle | prep | recording | analyzing | finished
   const [error, setError] = useState('')
   const [final, setFinal] = useState(null)
 
@@ -330,7 +332,8 @@ export default function App(){
         if(next===0){
           clearThinkTimer()
           document.getElementById('ding-btn')?.click()
-          setStartTrigger(t=>t+1) // auto-start recording
+          setPhase('recording')              // NEW: enter recording phase on auto-start
+          setStartTrigger(t=>t+1)            // auto-start recorder
         }
         return next
       })
@@ -357,7 +360,14 @@ export default function App(){
 
   function handleStartNow(){
     clearThinkTimer()
+    setPhase('recording')          // NEW
     setStartTrigger(t=>t+1)
+  }
+
+  function handleRecStarted(){
+    // If user hits the Recorder’s own Start button, stop the thinking timer too
+    clearThinkTimer()
+    setPhase('recording')
   }
 
   function handleRecError(msg){ setError(msg) }
@@ -386,7 +396,7 @@ export default function App(){
         return
       }
 
-      // prepare next turn
+      // next turn
       setTurnsSoFar(t=>t+1)
       if(res.next_level) setCurrentLevel(res.next_level)
       if(res.next_prompt) setPrompt(res.next_prompt)
@@ -450,10 +460,10 @@ export default function App(){
           )}
 
           <div style={{marginTop:12}}>
-            {/* KEY here forces a clean remount every turn, fixing the “Start does nothing” issue */}
             <Recorder
               key={`${sessionId}-${turnsSoFar}`}
               triggerStart={startTrigger}
+              onStarted={handleRecStarted}     // NEW
               onComplete={onRecordingComplete}
               onError={handleRecError}
               minSpeakSeconds={15}
