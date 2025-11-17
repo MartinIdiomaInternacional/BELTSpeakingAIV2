@@ -1,9 +1,5 @@
-import librosa
-import numpy as np
-import torch
+import librosa, numpy as np, torch
 
-
-def extract_features(audio: np.ndarray, sr: int) -> torch.Tensor:
+def extract_features(audio, sr):
     mfcc = librosa.feature.mfcc(y=audio, sr=sr, n_mfcc=13)
-    mfcc_mean = mfcc.mean(axis=1)
-    return torch.tensor(mfcc_mean, dtype=torch.float32)
+    return torch.tensor(mfcc.mean(axis=1), dtype=torch.float32)
