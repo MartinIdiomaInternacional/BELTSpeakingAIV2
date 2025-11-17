@@ -1,191 +1,159 @@
-import { useEffect, useRef, useState } from 'react'
-import WaveformCanvas from './WaveformCanvas'
+import React, { useEffect, useRef, useState } from "react";
+import Countdown from "./Countdown";
+import WaveformCanvas from "./WaveformCanvas";
+import { evaluateSpeaking } from "../lib/api";
 
-function blobToBase64(blob){
-  return new Promise((resolve)=>{
-    const reader = new FileReader()
-    reader.onload = ()=> resolve(reader.result.split(',')[1])
-    reader.readAsDataURL(blob)
-  })
-}
+export default function Recorder({ taskId, task, onFinished }) {
+  const [isRecording, setIsRecording] = useState(false);
+  const [secondsLeft, setSecondsLeft] = useState(task.maxSeconds);
+  const [status, setStatus] = useState("");
+  const [result, setResult] = useState(null);
+  const [loading, setLoading] = useState(false);
 
-function pickMime(){
-  const prefs = [
-    'audio/webm;codecs=opus',
-    'audio/webm',
-    'audio/ogg;codecs=opus',
-    'audio/ogg',
-    'audio/mp4',
-  ]
-  for (const t of prefs){
-    if (window.MediaRecorder && MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) return t
-  }
-  return ''
-}
+  const mediaRecorderRef = useRef(null);
+  const chunksRef = useRef([]);
+  const timerRef = useRef(null);
 
-export default function Recorder({
-  autoStart = false,
-  onComplete,
-  minSpeakSeconds = 15,
-  silenceStopSeconds = 3,
-  silenceThreshold = 0.012,
-  monitorFps = 20,
-  chunkMs = 250,
-}){
-  const chunksRef = useRef([])
-  const [stream, setStream] = useState(null)
-  const recRef = useRef(null)
-  const [recording, setRecording] = useState(false)
-  const [err, setErr] = useState('')
-
-  const audioCtxRef = useRef(null)
-  const analyserRef = useRef(null)
-  const rafRef = useRef(null)
-  const voicedAccumRef = useRef(0)
-  const silenceAccumRef = useRef(0)
-  const lastTickRef = useRef(0)
-  const doneRef = useRef(false)
-
-  useEffect(()=>{
-    if(!stream) return
-    const ctx = new (window.AudioContext || window.webkitAudioContext)()
-    const src = ctx.createMediaStreamSource(stream)
-    const analyser = ctx.createAnalyser()
-    analyser.fftSize = 1024
-    src.connect(analyser)
-    audioCtxRef.current = ctx
-    analyserRef.current = analyser
-    return ()=>{ try{ ctx.close() }catch{} }
-  }, [stream])
-
-  useEffect(()=>{
-    if(autoStart){
-      start()
+  useEffect(() => {
+    if (!isRecording) {
+      clearInterval(timerRef.current);
+      return;
     }
+
+    setSecondsLeft(task.maxSeconds);
+    timerRef.current = setInterval(() => {
+      setSecondsLeft((prev) => {
+        if (prev <= 1) {
+          clearInterval(timerRef.current);
+          stopRecording();
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+
+    return () => clearInterval(timerRef.current);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [autoStart])
+  }, [isRecording, task.maxSeconds]);
 
-  async function ensureStream(){
-    if (stream) return stream
-    try{
-      const s = await navigator.mediaDevices.getUserMedia({ audio: true })
-      setStream(s)
-      return s
-    }catch(e){
-      console.error(e)
-      setErr('Microphone permission denied or unavailable. Please allow mic access and try again.')
-      throw e
+  const startRecording = async () => {
+    try {
+      setResult(null);
+      setStatus("Requesting microphone…");
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+
+      const mediaRecorder = new MediaRecorder(stream);
+      mediaRecorderRef.current = mediaRecorder;
+      chunksRef.current = [];
+
+      mediaRecorder.ondataavailable = (e) => {
+        if (e.data.size > 0) chunksRef.current.push(e.data);
+      };
+
+      mediaRecorder.onstop = async () => {
+        setStatus("Processing audio…");
+        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
+        await sendToApi(blob);
+        stream.getTracks().forEach((t) => t.stop());
+      };
+
+      mediaRecorder.start();
+      setIsRecording(true);
+      setStatus("Recording…");
+    } catch (err) {
+      console.error(err);
+      setStatus("Microphone access blocked or unavailable.");
     }
-  }
+  };
 
-  async function start(){
-    try{
-      const s = await ensureStream()
-      setErr('')
-
-      const mimeType = pickMime()
-      const mr = new MediaRecorder(s, mimeType ? { mimeType } : {})
-      recRef.current = mr
-      chunksRef.current = []
-      doneRef.current = false
-
-      mr.ondataavailable = (e)=>{
-        if(e.data && e.data.size > 0){
-          chunksRef.current.push(e.data)
-        }
-      }
-
-      mr.onerror = (e)=> {
-        console.error('MediaRecorder error', e)
-        setErr('Recording error. Please try again.')
-      }
-
-      mr.onstop = async ()=>{
-        stopMonitor()
-        try{
-          const blob = new Blob(chunksRef.current, { type: mimeType || 'audio/webm' })
-          chunksRef.current = []
-          if (!doneRef.current){
-            doneRef.current = true
-            const base64 = await blobToBase64(blob)
-            try{ s.getTracks().forEach(t => t.stop()) }catch{}
-            onComplete?.({ base64, sampleRate: 48000 })
-          }
-        }catch(err2){
-          console.error(err2)
-          setErr('Could not finalize audio. Please try again.')
-        }
-      }
-
-      voicedAccumRef.current = 0
-      silenceAccumRef.current = 0
-      lastTickRef.current = performance.now()
-      mr.start(chunkMs)
-      setRecording(true)
-      startMonitor()
-    }catch(_){}
-  }
-
-  function stop(){
-    const mr = recRef.current
-    if(!mr || mr.state !== 'recording') return
-    try{ mr.requestData() }catch{}
-    try{ mr.stop() }catch(e){ console.error(e) }
-    setRecording(false)
-  }
-
-  function startMonitor(){
-    const analyser = analyserRef.current
-    if(!analyser) return
-    const buf = new Float32Array(analyser.fftSize)
-    const intervalMs = 1000/monitorFps
-
-    const tick = ()=>{
-      rafRef.current = setTimeout(()=>{
-        try{ analyser.getFloatTimeDomainData(buf) }catch{ return }
-        let sum = 0
-        for(let i=0;i<buf.length;i++){ const v = buf[i]; sum += v*v }
-        const rms = Math.sqrt(sum / buf.length)
-
-        const now = performance.now()
-        const dt = Math.max(0, (now - lastTickRef.current)/1000)
-        lastTickRef.current = now
-
-        if(rms > silenceThreshold){
-          voicedAccumRef.current += dt
-          silenceAccumRef.current = 0
-        } else {
-          if(voicedAccumRef.current >= minSpeakSeconds){
-            silenceAccumRef.current += dt
-            if(silenceAccumRef.current >= silenceStopSeconds){
-              stop()
-              return
-            }
-          }
-        }
-        tick()
-      }, intervalMs)
+  const stopRecording = () => {
+    if (!mediaRecorderRef.current) return;
+    if (mediaRecorderRef.current.state === "recording") {
+      mediaRecorderRef.current.stop();
     }
-    lastTickRef.current = performance.now()
-    tick()
-  }
+    setIsRecording(false);
+  };
 
-  function stopMonitor(){
-    if(rafRef.current){ clearTimeout(rafRef.current); rafRef.current = null }
-  }
+  const sendToApi = async (audioBlob) => {
+    setLoading(true);
+    try {
+      const data = await evaluateSpeaking({
+        audioBlob,
+        taskId,
+      });
+      setResult(data);
+      setStatus("Result received.");
+      if (onFinished) {
+        onFinished(taskId, data);
+      }
+    } catch (err) {
+      console.error(err);
+      setStatus(`Error: ${err.message}`);
+    } finally {
+      setLoading(false);
+    }
+  };
 
   return (
-    <div className="card">
-      <h3>Recording</h3>
-      <WaveformCanvas stream={stream} />
-      <div style={{display:'flex', gap:8, marginTop:8}}>
-        <button className="btn" onClick={start} disabled={recording}>Start</button>
-        <button className="btn" onClick={stop} disabled={!recording}>Stop</button>
-        <div className="small" style={{marginLeft:'auto'}}>
-          Auto-stop after {minSpeakSeconds}s spoken + {silenceStopSeconds}s silence
-        </div>
+    <div className="recorder">
+      <div className="recorder-header">
+        <h2>{task.title}</h2>
+        <p className="task-text">{task.text}</p>
       </div>
-      {err && <div className="small" style={{color:'var(--danger)', marginTop:8}}>{err}</div>}
+
+      <WaveformCanvas isRecording={isRecording} />
+
+      <div className="recorder-controls">
+        <button
+          onClick={startRecording}
+          disabled={isRecording || loading}
+          className="btn primary"
+        >
+          {isRecording ? "Recording…" : "Start recording"}
+        </button>
+
+        <button
+          onClick={stopRecording}
+          disabled={!isRecording}
+          className="btn secondary"
+        >
+          Stop
+        </button>
+
+        <Countdown seconds={secondsLeft} isRunning={isRecording} />
+      </div>
+
+      <div className="recorder-status">
+        {status && <p>{status}</p>}
+        {loading && <p>Sending audio to evaluation service…</p>}
+      </div>
+
+      {result && (
+        <div className="recorder-result">
+          <h3>Result</h3>
+          <p>
+            <strong>Level:</strong> {result.score}
+          </p>
+          <p>
+            <strong>Explanation:</strong> {result.explanation}
+          </p>
+          <p>
+            <strong>Recommendations:</strong>
+          </p>
+          <p className="recommendations">
+            {result.recommendations.split("\n").map((line, idx) => (
+              <span key={idx}>
+                {line}
+                <br />
+              </span>
+            ))}
+          </p>
+          <p>
+            <strong>Duration (approx.):</strong>{" "}
+            {result.seconds ? result.seconds.toFixed(1) : "—"} seconds
+          </p>
+        </div>
+      )}
     </div>
-  )
+  );
 }
