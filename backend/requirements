@@ -1,7 +1,0 @@
-fastapi
-uvicorn[standard]
-librosa
-numpy
-soundfile
-torch
-python-multipart
