@@ -1,14 +1,14 @@
-import React from "react";
 
-export default function LanguageSelect({ value, onChange }) {
+import { useState } from 'react'
+export default function LanguageSelect({ onChange }) {
+  const [lang, setLang] = useState('es')
   return (
-    <div className="language-select">
-      <label>
-        Test language:
-        <select value={value} onChange={(e) => onChange(e.target.value)}>
-          <option value="en">English</option>
-        </select>
-      </label>
+    <div className="card" style={{marginBottom:16}}>
+      <div className="label">Native language for feedback</div>
+      <select value={lang} onChange={(e)=>{ setLang(e.target.value); onChange?.(e.target.value); }}>
+        <option value="en">English</option>
+        <option value="es">Español</option>
+      </select>
     </div>
-  );
+  )
 }

@@ -1,1 +1,12 @@
-body{font-family:sans-serif;}
+
+:root { --ok:#16a34a; --warn:#f59e0b; --danger:#dc2626; }
+body { font-family: system-ui, Segoe UI, Arial; margin: 20px; }
+.card { border: 1px solid #ddd; border-radius: 16px; padding: 16px; box-shadow: 0 6px 20px rgba(0,0,0,.06); }
+.btn { padding: 10px 14px; border-radius: 12px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
+.btn:disabled { opacity: .5; cursor: not-allowed; }
+.progress { height: 12px; background: #eee; border-radius: 999px; overflow:hidden; }
+.progress > div { height: 100%; width: 0%; transition: width .15s linear; }
+.wave { width: 100%; height: 64px; background: #f7fafc; border-radius: 12px; }
+select, input { padding: 8px; border-radius: 10px; border: 1px solid #ccc; }
+.label { font-size: 12px; color: #555; }
+.small { font-size: 12px; color: #666; }
