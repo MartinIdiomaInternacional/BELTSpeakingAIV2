@@ -1,12 +1,130 @@
+body {
+  margin: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  background: #f4f4f6;
+  color: #111827;
+}
 
-:root { --ok:#16a34a; --warn:#f59e0b; --danger:#dc2626; }
-body { font-family: system-ui, Segoe UI, Arial; margin: 20px; }
-.card { border: 1px solid #ddd; border-radius: 16px; padding: 16px; box-shadow: 0 6px 20px rgba(0,0,0,.06); }
-.btn { padding: 10px 14px; border-radius: 12px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
-.btn:disabled { opacity: .5; cursor: not-allowed; }
-.progress { height: 12px; background: #eee; border-radius: 999px; overflow:hidden; }
-.progress > div { height: 100%; width: 0%; transition: width .15s linear; }
-.wave { width: 100%; height: 64px; background: #f7fafc; border-radius: 12px; }
-select, input { padding: 8px; border-radius: 10px; border: 1px solid #ccc; }
-.label { font-size: 12px; color: #555; }
-.small { font-size: 12px; color: #666; }
+.app {
+  max-width: 800px;
+  margin: 40px auto;
+  padding: 24px;
+  background: #ffffff;
+  border-radius: 12px;
+  box-shadow: 0 10px 30px rgba(15, 23, 42, 0.08);
+}
+
+.app-header {
+  text-align: center;
+  margin-bottom: 24px;
+}
+
+.app-header h1 {
+  margin: 0;
+  font-size: 1.8rem;
+}
+
+.subtitle {
+  margin-top: 4px;
+  font-size: 0.9rem;
+  color: #6b7280;
+}
+
+.language-select {
+  margin-bottom: 16px;
+}
+
+.language-select select {
+  margin-left: 8px;
+}
+
+.recorder {
+  border: 1px solid #e5e7eb;
+  border-radius: 10px;
+  padding: 16px;
+  margin-bottom: 16px;
+}
+
+.recorder-header h2 {
+  margin: 0 0 4px 0;
+}
+
+.task-text {
+  margin-top: 4px;
+  color: #4b5563;
+}
+
+.recorder-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.countdown {
+  margin-left: auto;
+}
+
+.countdown-time {
+  font-weight: 600;
+  font-size: 1.05rem;
+}
+
+.waveform-canvas {
+  width: 100%;
+  display: block;
+  margin-top: 8px;
+  background: #f9fafb;
+  border-radius: 6px;
+}
+
+.btn {
+  padding: 8px 16px;
+  border-radius: 6px;
+  border: none;
+  cursor: pointer;
+  font-size: 0.95rem;
+}
+
+.btn.primary {
+  background: #2563eb;
+  color: #ffffff;
+}
+
+.btn.secondary {
+  background: #e5e7eb;
+  color: #111827;
+}
+
+.btn.tertiary {
+  background: #10b981;
+  color: #ffffff;
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.recorder-status {
+  margin-top: 10px;
+  font-size: 0.9rem;
+  color: #4b5563;
+}
+
+.recorder-result {
+  margin-top: 16px;
+  padding-top: 10px;
+  border-top: 1px solid #e5e7eb;
+}
+
+.recommendations {
+  white-space: pre-wrap;
+}
+
+.task-navigation {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 12px;
+}
