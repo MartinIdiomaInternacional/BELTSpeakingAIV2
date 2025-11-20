@@ -6,7 +6,7 @@ services:
     autoDeploy: true
     dockerfilePath: backend/Dockerfile
     region: oregon
-    healthCheckPath: /health
+    healthCheckPath: /
     envVars: []
 
   - type: web
@@ -18,4 +18,4 @@ services:
     region: oregon
     envVars:
       - key: API_URL
-        value: "https://REPLACE_WITH_API_URL"
+        value: "https://REPLACE_WITH_BACKEND_URL"
