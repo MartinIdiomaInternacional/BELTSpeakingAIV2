@@ -1,34 +1,179 @@
-
-from typing import Tuple, Dict
 import numpy as np
+import torch
 
-LEVELS = ["A1","A2","B1","B1+","B2","B2+","C1","C2"]
+from app.scoring.audio_features import (
+    load_audio,
+    extract_feature_vector,
+    extract_debug_metrics,
+)
 
-THRESH = {
-    "voiced_ratio":      [0.15, 0.25, 0.35, 0.45, 0.55, 0.65, 0.75, 0.85],
-    "speech_rate_proxy": [5,    6,    7,    8,    9,    10,   11,   12],
-    "avg_zcr":           [0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09],
-}
-WEIGHTS = {"voiced_ratio":0.45,"speech_rate_proxy":0.35,"avg_zcr":0.20}
 
-def _metric_to_score(value: float, grid: list) -> float:
-    score = 0.0
-    for i, t in enumerate(grid):
-        if value >= t:
-            score = i+1
-    return float(score)
+def _rule_based_score(features: torch.Tensor, metrics: dict) -> float:
+    """
+    Rule-based 'model' that maps acoustic features to a 0–1 proficiency score.
 
-def score_from_features(feats: Dict[str, float]) -> Tuple[float, float, Dict]:
-    s_vr = _metric_to_score(feats["voiced_ratio"], THRESH["voiced_ratio"])
-    s_sr = _metric_to_score(feats["speech_rate_proxy"], THRESH["speech_rate_proxy"])
-    s_zc = _metric_to_score(feats["avg_zcr"], THRESH["avg_zcr"])
-    score = WEIGHTS["voiced_ratio"]*s_vr + WEIGHTS["speech_rate_proxy"]*s_sr + WEIGHTS["avg_zcr"]*s_zc
+    Intuition:
+    - Longer speaking time (up to a point) → more fluent
+    - Higher speech activity (less silence) → more fluent
+    - Lower ZCR (less noisy / choppy) → more stable speech signal
+    """
 
-    spread = np.std([s_vr, s_sr, s_zc])
-    confidence = float(max(0.3, 1.0 - spread/4.0))
-    metrics = {"s_voiced_ratio": s_vr, "s_speech_rate": s_sr, "s_avg_zcr": s_zc, "confidence_components_spread": spread}
-    return float(score), confidence, metrics
+    duration = float(metrics["duration_sec"])
+    speech_ratio = float(metrics["speech_ratio"])
+    zcr_mean = float(metrics["zcr_mean"])
 
-def map_score_to_level(score_0_8: float) -> str:
-    idx = int(max(0, min(7, round(score_0_8))))
-    return LEVELS[idx]
+    # 1) Fluency: how long the person spoke.
+    #    0 sec → 0.0, 30+ sec → ~1.0
+    fluency = np.clip(duration / 30.0, 0.0, 1.0)
+
+    # 2) Speech activity: how much of the recording has actual voice.
+    #    0.0 → all silence, 1.0 → constant speech
+    activity = float(np.clip(speech_ratio, 0.0, 1.0))
+
+    # 3) Stability: lower ZCR suggests smoother, less noisy voice
+    #    ZCR ~ 0.02–0.08 typical speech; we invert it into a 0–1 score.
+    #    If zcr_mean is high, stability is lower.
+    stability = float(np.clip(0.1 - zcr_mean, 0.0, 0.1) / 0.1)
+
+    # Weighted combination
+    # You can tune these weights later if needed.
+    score = 0.5 * fluency + 0.3 * activity + 0.2 * stability
+    return float(np.clip(score, 0.0, 1.0))
+
+
+def _score_to_cefr(score: float) -> str:
+    """Map a 0–1 global score into CEFR-like levels."""
+    if score >= 0.8:
+        return "C1"
+    if score >= 0.6:
+        return "B2"
+    if score >= 0.4:
+        return "B1"
+    return "A2"
+
+
+def _build_explanation(level: str, metrics: dict) -> str:
+    """Generate a short explanation using the metrics."""
+
+    duration = metrics["duration_sec"]
+    speech_ratio = metrics["speech_ratio"]
+    silence_ratio = metrics["silence_ratio"]
+
+    if level == "C1":
+        return (
+            "Your speaking sample is long and continuous, with few pauses and a stable signal. "
+            f"You spoke for approximately {duration:.1f} seconds, with voice present during most "
+            "of the recording. This suggests strong fluency and good control when speaking."
+        )
+    if level == "B2":
+        return (
+            "Your speaking sample shows generally good fluency and fairly continuous speech. "
+            f"You spoke for around {duration:.1f} seconds and maintained voice during a large "
+            "portion of the recording, with some pauses or hesitations."
+        )
+    if level == "B1":
+        return (
+            "Your speaking sample shows basic fluency, but with more frequent pauses and shorter segments. "
+            f"You spoke for about {duration:.1f} seconds and there is a noticeable proportion of silence. "
+            "This suggests you can communicate core ideas but may hesitate or stop to think often."
+        )
+    # A2
+    return (
+        "Your speaking sample is relatively short with significant silence. "
+        f"You spoke for roughly {duration:.1f} seconds and a large part of the recording has no voice, "
+        "which suggests limited fluency and short, simple responses."
+    )
+
+
+def _build_recommendations(level: str, metrics: dict) -> str:
+    """Generate concrete recommendations based on the level and metrics."""
+
+    duration = metrics["duration_sec"]
+    speech_ratio = metrics["speech_ratio"]
+
+    recs = []
+
+    # Generic fluency recommendation
+    if duration < 20:
+        recs.append(
+            "- Practice giving longer answers (aim for 30–45 seconds per question)."
+        )
+    else:
+        recs.append(
+            "- Keep giving extended answers and try to include more detail and examples."
+        )
+
+    # Silence vs speech
+    if speech_ratio < 0.5:
+        recs.append(
+            "- Reduce long pauses by planning 2–3 key ideas before you start speaking."
+        )
+    elif speech_ratio < 0.7:
+        recs.append(
+            "- Continue improving your fluency by connecting ideas with linking phrases."
+        )
+    else:
+        recs.append(
+            "- Your speech is quite continuous; focus now on accuracy and range of language."
+        )
+
+    # Level-specific advice
+    if level == "C1":
+        recs.extend(
+            [
+                "- Work on nuance in tone and register depending on the situation.",
+                "- Incorporate more advanced, domain-specific vocabulary in your field.",
+            ]
+        )
+    elif level == "B2":
+        recs.extend(
+            [
+                "- Use more precise vocabulary when explaining complex ideas.",
+                "- Practice discussing abstract topics and giving structured opinions.",
+            ]
+        )
+    elif level == "B1":
+        recs.extend(
+            [
+                "- Strengthen your sentence structure so you can build longer, clearer ideas.",
+                "- Learn and reuse common phrases and collocations to speak more naturally.",
+            ]
+        )
+    else:  # A2
+        recs.extend(
+            [
+                "- Focus on very common topics (family, work, daily routine) and simple sentences.",
+                "- Memorize and practice basic patterns like 'I usually...', 'I would like to...', "
+                "to increase confidence.",
+            ]
+        )
+
+    return "\n".join(recs)
+
+
+def evaluate_audio(path: str):
+    """
+    Main entry point used by the FastAPI app.
+
+    1. Load audio & extract features
+    2. Compute a 0–1 proficiency score using a rule-based 'model'
+    3. Map score → CEFR level
+    4. Generate explanation + recommendations
+    """
+    audio, sr = load_audio(path)
+    features = extract_feature_vector(audio, sr)
+    metrics = extract_debug_metrics(audio, sr)
+
+    global_score = _rule_based_score(features, metrics)
+    level = _score_to_cefr(global_score)
+    explanation = _build_explanation(level, metrics)
+    recommendations = _build_recommendations(level, metrics)
+
+    return {
+        "level": level,
+        "explanation": explanation,
+        "recommendations": recommendations,
+        "seconds": float(metrics["duration_sec"]),
+        "score_raw": float(global_score),
+        "metrics": metrics,  # keep this if you ever want to inspect stats
+    }
