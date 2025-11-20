@@ -1,29 +1,22 @@
+// Simple client for the BELT Speaking AI 2.0 backend.
+// We assume Nginx (in production) proxies /api/* to the FastAPI service.
 
-const BASE = import.meta.env.VITE_API_BASE || '/api';
+const BASE = import.meta.env.VITE_API_BASE || "/api";
 
-export async function startSession(candidateId, nativeLanguage) {
-  const res = await fetch(`${BASE}/start`, {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ candidate_id: candidateId, native_language: nativeLanguage })
+export async function evaluateSpeaking({ audioBlob, taskId }) {
+  const formData = new FormData();
+  formData.append("audio", audioBlob, `task${taskId}.webm`);
+  formData.append("task_id", String(taskId));
+
+  const res = await fetch(`${BASE}/evaluate`, {
+    method: "POST",
+    body: formData,
   });
-  if(!res.ok) throw new Error('Failed to start session');
-  return res.json();
-}
 
-export async function evaluateBytes(sessionId, sampleRate, wavBase64) {
-  const res = await fetch(`${BASE}/evaluate-bytes`, {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ session_id: sessionId, sample_rate: sampleRate, wav_base64: wavBase64 })
-  });
-  if(!res.ok) throw new Error('Failed to evaluate audio');
-  return res.json();
-}
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    throw new Error(`API error (${res.status}): ${text || "Unknown error"}`);
+  }
 
-export async function getReport(sessionId, nativeLanguage) {
-  const res = await fetch(`${BASE}/report`, {
-    method: 'POST', headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({ session_id: sessionId, native_language: nativeLanguage })
-  });
-  if(!res.ok) throw new Error('Failed to build report');
-  return res.json();
+  return res.json(); // { score, explanation, recommendations, seconds, task_id }
 }
