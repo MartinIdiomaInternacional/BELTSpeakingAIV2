@@ -2,10 +2,11 @@ from datetime import datetime
 import tempfile
 from typing import Dict, Any, Optional
 
+import numpy as np
+import librosa
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.scoring.audio_features import compute_basic_features
 from app.scoring.cefr_scorer import score_from_features, map_score_to_level
 from app.scoring.text_cefr import score_transcript_cefr
 from app.nlp.transcription import transcribe_audio
@@ -47,6 +48,102 @@ TASK_PROMPTS: Dict[int, str] = {
         "Give their opinion on whether technology has improved communication and why."
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Local acoustic feature computation (self-contained)
+# ---------------------------------------------------------------------------
+
+
+def _safe_log10(x: float) -> float:
+    return float(np.log10(max(x, 1e-8)))
+
+
+def compute_basic_features(y, sr: int) -> Dict[str, float]:
+    """
+    Compute the core acoustic features used by the BELT Speaking AI scorer.
+
+    Returns a dict with (at least) the following keys:
+      - duration_s
+      - voiced_ratio
+      - voiced_s
+      - avg_energy
+      - avg_zcr
+      - speech_rate_proxy
+      - snr_db
+    """
+    y = np.asarray(y, dtype=np.float32)
+
+    # Duration (seconds)
+    duration_s = float(len(y) / float(sr)) if sr > 0 else 0.0
+
+    # Frame settings
+    frame_length = 1024
+    hop_length = 512
+
+    # RMS energy per frame
+    rms = librosa.feature.rms(
+        y=y, frame_length=frame_length, hop_length=hop_length
+    )[0]  # shape (n_frames,)
+    rms = np.asarray(rms, dtype=np.float32)
+
+    if rms.size == 0:
+        # Edge case: empty or too short audio
+        return {
+            "duration_s": 0.0,
+            "voiced_ratio": 0.0,
+            "voiced_s": 0.0,
+            "avg_energy": 0.0,
+            "avg_zcr": 0.0,
+            "speech_rate_proxy": 0.0,
+            "snr_db": 0.0,
+        }
+
+    # Threshold for "voiced" frames: fraction of max RMS
+    max_rms = float(rms.max())
+    energy_threshold = 0.4 * max_rms if max_rms > 0 else 0.0
+    voiced_mask = rms > energy_threshold
+    voiced_ratio = float(voiced_mask.mean())
+    voiced_s = float(voiced_ratio * duration_s)
+
+    # Average energy (RMS)
+    avg_energy = float(rms.mean())
+
+    # Zero-crossing rate
+    zcr = librosa.feature.zero_crossing_rate(
+        y=y, frame_length=frame_length, hop_length=hop_length
+    )[0]
+    avg_zcr = float(zcr.mean()) if zcr.size > 0 else 0.0
+
+    # Approximate speech rate: number of voiced frames per second
+    frames_per_second = float(sr) / float(hop_length) if hop_length > 0 else 0.0
+    voiced_frames = float(voiced_mask.sum())
+    if duration_s > 0:
+        speech_rate_proxy = voiced_frames / duration_s
+    else:
+        speech_rate_proxy = 0.0
+
+    # Very rough SNR estimate:
+    #   - "signal" = high-energy frames
+    #   - "noise"  = low-energy frames
+    high_energy = rms[voiced_mask]
+    low_energy = rms[~voiced_mask]
+    if high_energy.size > 0 and low_energy.size > 0:
+        signal_power = float(np.mean(high_energy ** 2))
+        noise_power = float(np.mean(low_energy ** 2))
+        snr_db = 10.0 * _safe_log10(signal_power / (noise_power + 1e-8))
+    else:
+        snr_db = 0.0
+
+    return {
+        "duration_s": float(duration_s),
+        "voiced_ratio": float(voiced_ratio),
+        "voiced_s": float(voiced_s),
+        "avg_energy": float(avg_energy),
+        "avg_zcr": float(avg_zcr),
+        "speech_rate_proxy": float(speech_rate_proxy),
+        "snr_db": float(snr_db),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -213,7 +310,7 @@ async def evaluate(
 
     Steps:
     1) Save uploaded audio to a temporary WAV file.
-    2) Acoustic scoring (your classic BELT metrics -> CEFR level A1–C2).
+    2) Acoustic scoring (BELT metrics -> CEFR level A1–C2).
     3) ASR transcription (Whisper) to text.
     4) Text-based CEFR analysis with GPT (grammar, vocabulary, coherence, etc.).
     5) Combine into a final level, explanation and recommendations.
@@ -227,11 +324,9 @@ async def evaluate(
         tmp_path = tmp.name
 
     # ------------------------------------------------------------------ #
-    # 2) Acoustic feature pipeline (existing BELT logic)
+    # 2) Acoustic feature pipeline (BELT logic)
     # ------------------------------------------------------------------ #
-    from librosa import load  # local import so backend can import even if unused elsewhere
-
-    y, sr = load(tmp_path, sr=16000)
+    y, sr = librosa.load(tmp_path, sr=16000)
     feats = compute_basic_features(y, sr)
 
     score_0_8, confidence, metrics = score_from_features(feats)
@@ -263,7 +358,6 @@ async def evaluate(
                 target_language="English",
             )
         except Exception as e:
-            # Do not break the whole API if text scoring fails
             print(f"[evaluate] Error during text CEFR scoring: {e}")
             text_eval = None
 
@@ -289,7 +383,6 @@ async def evaluate(
             else acoustic_recs
         )
     else:
-        # Fallback: acoustic-only
         overall_level = acoustic_level
         text_level = None
         explanation = acoustic_explanation
@@ -308,10 +401,8 @@ async def evaluate(
         recommendations=recommendations,
     )
 
-    # Make metrics JSON-friendly (no numpy types)
     metrics_json = {k: float(v) for k, v in metrics.items()}
 
-    # Text evaluation pieces (may be None)
     dimensions = (text_eval or {}).get("dimensions")
     text_overall_comment = (text_eval or {}).get("overall_comment")
     text_improvement = (text_eval or {}).get("improvement_advice")
