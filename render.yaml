@@ -18,4 +18,4 @@ services:
     region: oregon
     envVars:
       - key: API_URL
-        value: "https://beltspeakingaiv2-web.onrender.com"
+        value: "https://beltspeakingaiv2.onrender.com"
