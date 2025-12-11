@@ -16,6 +16,15 @@ def load_audio(path: str, sr: int = 16000) -> Tuple[np.ndarray, int]:
     return y.astype(np.float32), sr
 
 
+def extract_feature_vector(y: np.ndarray, sr: int) -> Dict[str, float]:
+    """
+    Legacy function required by older BELT code.
+    The new pipeline does NOT use it, but cefr_scorer still imports it.
+    We return the same structure as compute_basic_features to keep compatibility.
+    """
+    return compute_basic_features(y, sr)
+
+
 # -------------------------------------------------------------
 # Helper used by the original BELT feature-based model
 # -------------------------------------------------------------
