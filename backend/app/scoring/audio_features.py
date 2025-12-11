@@ -4,13 +4,13 @@ from typing import Dict, Tuple
 
 
 # -------------------------------------------------------------
-# Minimal helper to satisfy cefr_scorer imports
+# Minimal helpers to satisfy cefr_scorer imports
 # -------------------------------------------------------------
 
 def load_audio(path: str, sr: int = 16000) -> Tuple[np.ndarray, int]:
     """
     Simple wrapper to load audio from a file path using librosa.
-    This exists only because cefr_scorer.py imports it.
+    This exists because cefr_scorer.py imports it.
     """
     y, sr = librosa.load(path, sr=sr)
     return y.astype(np.float32), sr
@@ -19,14 +19,22 @@ def load_audio(path: str, sr: int = 16000) -> Tuple[np.ndarray, int]:
 def extract_feature_vector(y: np.ndarray, sr: int) -> Dict[str, float]:
     """
     Legacy function required by older BELT code.
-    The new pipeline does NOT use it, but cefr_scorer still imports it.
-    We return the same structure as compute_basic_features to keep compatibility.
+    The new pipeline does not rely on it explicitly, but cefr_scorer imports it.
+    We simply return the same structure as compute_basic_features to keep compatibility.
+    """
+    return compute_basic_features(y, sr)
+
+
+def extract_debug_metrics(y: np.ndarray, sr: int) -> Dict[str, float]:
+    """
+    Legacy helper for debugging metrics, required by cefr_scorer imports.
+    For now, we just mirror compute_basic_features so that the API remains simple.
     """
     return compute_basic_features(y, sr)
 
 
 # -------------------------------------------------------------
-# Helper used by the original BELT feature-based model
+# Core acoustic feature computation used by the BELT feature model
 # -------------------------------------------------------------
 
 def _safe_log10(x: float) -> float:
