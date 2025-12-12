@@ -1,3 +1,4 @@
+import DimensionRadar from "./components/DimensionRadar";
 import React, { useState, useMemo } from "react";
 import Recorder from "./components/Recorder";
 import LanguageSelect from "./components/LanguageSelect";
