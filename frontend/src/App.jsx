@@ -161,6 +161,10 @@ export default function App() {
       {globalSummary && (
         <section className="global-results">
           <h2>Overall Speaking Result</h2>
+<h3>Dimension Profile</h3>
+<DimensionRadar
+  dimensionAverages={globalSummary.dimensionAverages}
+/>
 
           <p className="global-level">
             <strong>Global CEFR Level:</strong>{" "}
