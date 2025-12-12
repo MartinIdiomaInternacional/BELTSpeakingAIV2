@@ -1,7 +1,7 @@
-import DimensionRadar from "./components/DimensionRadar";
 import React, { useState, useMemo } from "react";
 import Recorder from "./components/Recorder";
 import LanguageSelect from "./components/LanguageSelect";
+import DimensionRadar from "./components/DimensionRadar";
 
 const TASKS = [
   {
@@ -34,6 +34,17 @@ const DIMENSIONS = [
   "pronunciation",
   "coherence",
 ];
+
+// Dimension weights (sum to 1.00)
+const DIMENSION_WEIGHTS = {
+  fluency: 0.25,
+  pronunciation: 0.2,
+  coherence: 0.15,
+  grammatical_range: 0.15,
+  grammatical_accuracy: 0.1,
+  lexical_range: 0.1,
+  lexical_control: 0.05,
+};
 
 // Numeric (0–6) → CEFR label
 function numericToLevel(score) {
@@ -68,15 +79,17 @@ export default function App() {
 
   // ------------------------------------------------------------
   // GLOBAL HYBRID SUMMARY (Option C)
+  // global = 0.6 * weighted_dim_avg + 0.4 * avg_task_total
   // ------------------------------------------------------------
   const globalSummary = useMemo(() => {
     const completedResults = Object.values(results).filter(Boolean);
     if (completedResults.length !== TASKS.length) return null;
 
-    let dimScores = [];
+    // Build per-dimension accumulators across all tasks
     let perDim = {};
     DIMENSIONS.forEach((d) => (perDim[d] = { sum: 0, count: 0 }));
 
+    // Collect task total scores (0–6) from GPT results
     let taskTotals = [];
 
     completedResults.forEach((r) => {
@@ -88,29 +101,39 @@ export default function App() {
       DIMENSIONS.forEach((d) => {
         const info = dims[d];
         if (info && typeof info.score === "number") {
-          dimScores.push(info.score);
           perDim[d].sum += info.score;
           perDim[d].count += 1;
         }
       });
     });
 
-    if (!dimScores.length || !taskTotals.length) return null;
+    if (!taskTotals.length) return null;
 
-    const avgDimScore =
-      dimScores.reduce((a, b) => a + b, 0) / dimScores.length;
-
+    // Average of task total scores (0–6)
     const avgTaskTotal =
       taskTotals.reduce((a, b) => a + b, 0) / taskTotals.length;
 
-    const hybridScore = 0.6 * avgDimScore + 0.4 * avgTaskTotal;
-
+    // Dimension averages (0–6) + weighted dimension score
     let dimensionAverages = {};
+    let weightedSum = 0;
+    let weightTotal = 0;
+
     DIMENSIONS.forEach((d) => {
       if (perDim[d].count > 0) {
-        dimensionAverages[d] = perDim[d].sum / perDim[d].count;
+        const avg = perDim[d].sum / perDim[d].count;
+        dimensionAverages[d] = avg;
+
+        const w = DIMENSION_WEIGHTS[d] || 0;
+        weightedSum += avg * w;
+        weightTotal += w;
       }
     });
+
+    const avgDimScore = weightTotal > 0 ? weightedSum / weightTotal : null;
+    if (avgDimScore == null) return null;
+
+    // Hybrid score (0–6)
+    const hybridScore = 0.6 * avgDimScore + 0.4 * avgTaskTotal;
 
     return {
       avgDimScore,
@@ -161,26 +184,26 @@ export default function App() {
       {globalSummary && (
         <section className="global-results">
           <h2>Overall Speaking Result</h2>
-<h3>Dimension Profile</h3>
-<DimensionRadar
-  dimensionAverages={globalSummary.dimensionAverages}
-/>
 
           <p className="global-level">
             <strong>Global CEFR Level:</strong>{" "}
-            <span className="level-badge">
-              {globalSummary.globalLevel}
-            </span>
+            <span className="level-badge">{globalSummary.globalLevel}</span>
           </p>
 
           <p className="score-details">
             Hybrid score (0–6):{" "}
-            <strong>{globalSummary.hybridScore.toFixed(2)}</strong>{" "}
+            <strong>{globalSummary.hybridScore.toFixed(2)}</strong>
             <br />
             <small>
-              (60% dimension averages + 40% task totals)
+              (60% weighted dimension score + 40% average task total)
             </small>
           </p>
+
+          {/* ✅ Add the Radar here */}
+          <h3>Dimension Profile</h3>
+          <DimensionRadar
+            dimensionAverages={globalSummary.dimensionAverages}
+          />
 
           <h3>Dimension Averages</h3>
           <table className="dimension-table">
