@@ -7,7 +7,6 @@ import librosa
 from fastapi import FastAPI, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.scoring.cefr_scorer import score_from_features, map_score_to_level
 from app.scoring.text_cefr import score_transcript_cefr
 from app.nlp.transcription import transcribe_audio
 from app.db import log_result
@@ -51,19 +50,16 @@ TASK_PROMPTS: Dict[int, str] = {
 
 
 # ---------------------------------------------------------------------------
-# Local acoustic feature computation (self-contained)
+# Acoustic feature computation (self-contained)
 # ---------------------------------------------------------------------------
-
 
 def _safe_log10(x: float) -> float:
     return float(np.log10(max(x, 1e-8)))
 
 
-def compute_basic_features(y, sr: int) -> Dict[str, float]:
+def compute_basic_features(y: np.ndarray, sr: int) -> Dict[str, float]:
     """
-    Compute the core acoustic features used by the BELT Speaking AI scorer.
-
-    Returns a dict with (at least) the following keys:
+    Compute core acoustic features:
       - duration_s
       - voiced_ratio
       - voiced_s
@@ -74,21 +70,16 @@ def compute_basic_features(y, sr: int) -> Dict[str, float]:
     """
     y = np.asarray(y, dtype=np.float32)
 
-    # Duration (seconds)
     duration_s = float(len(y) / float(sr)) if sr > 0 else 0.0
 
-    # Frame settings
     frame_length = 1024
     hop_length = 512
 
-    # RMS energy per frame
     rms = librosa.feature.rms(
         y=y, frame_length=frame_length, hop_length=hop_length
-    )[0]  # shape (n_frames,)
-    rms = np.asarray(rms, dtype=np.float32)
+    )[0]
 
     if rms.size == 0:
-        # Edge case: empty or too short audio
         return {
             "duration_s": 0.0,
             "voiced_ratio": 0.0,
@@ -99,33 +90,25 @@ def compute_basic_features(y, sr: int) -> Dict[str, float]:
             "snr_db": 0.0,
         }
 
-    # Threshold for "voiced" frames: fraction of max RMS
     max_rms = float(rms.max())
     energy_threshold = 0.4 * max_rms if max_rms > 0 else 0.0
     voiced_mask = rms > energy_threshold
     voiced_ratio = float(voiced_mask.mean())
     voiced_s = float(voiced_ratio * duration_s)
 
-    # Average energy (RMS)
     avg_energy = float(rms.mean())
 
-    # Zero-crossing rate
     zcr = librosa.feature.zero_crossing_rate(
         y=y, frame_length=frame_length, hop_length=hop_length
     )[0]
     avg_zcr = float(zcr.mean()) if zcr.size > 0 else 0.0
 
-    # Approximate speech rate: number of voiced frames per second
-    frames_per_second = float(sr) / float(hop_length) if hop_length > 0 else 0.0
     voiced_frames = float(voiced_mask.sum())
     if duration_s > 0:
         speech_rate_proxy = voiced_frames / duration_s
     else:
         speech_rate_proxy = 0.0
 
-    # Very rough SNR estimate:
-    #   - "signal" = high-energy frames
-    #   - "noise"  = low-energy frames
     high_energy = rms[voiced_mask]
     low_energy = rms[~voiced_mask]
     if high_energy.size > 0 and low_energy.size > 0:
@@ -136,20 +119,124 @@ def compute_basic_features(y, sr: int) -> Dict[str, float]:
         snr_db = 0.0
 
     return {
-        "duration_s": float(duration_s),
-        "voiced_ratio": float(voiced_ratio),
-        "voiced_s": float(voiced_s),
-        "avg_energy": float(avg_energy),
-        "avg_zcr": float(avg_zcr),
-        "speech_rate_proxy": float(speech_rate_proxy),
-        "snr_db": float(snr_db),
+        "duration_s": duration_s,
+        "voiced_ratio": voiced_ratio,
+        "voiced_s": voiced_s,
+        "avg_energy": avg_energy,
+        "avg_zcr": avg_zcr,
+        "speech_rate_proxy": speech_rate_proxy,
+        "snr_db": snr_db,
     }
+
+
+def score_from_features(feats: Dict[str, float]) -> (float, float, Dict[str, float]):
+    """
+    Simple rule-based scoring on a 0–8 scale using acoustic features.
+    Returns:
+      score_0_8, confidence, metrics_dict
+    """
+    duration_s = feats.get("duration_s", 0.0)
+    voiced_ratio = feats.get("voiced_ratio", 0.0)
+    speech_rate_proxy = feats.get("speech_rate_proxy", 0.0)
+    snr_db = feats.get("snr_db", 0.0)
+
+    # --- base score from duration ---
+    if duration_s < 10:
+        base = 1.0
+    elif duration_s < 20:
+        base = 2.0
+    elif duration_s < 30:
+        base = 3.0
+    elif duration_s < 45:
+        base = 4.0
+    elif duration_s < 60:
+        base = 5.0
+    else:
+        base = 6.0
+
+    # --- adjustments: voiced_ratio ---
+    if voiced_ratio < 0.3:
+        base -= 1.0
+    elif voiced_ratio < 0.5:
+        base -= 0.5
+    elif voiced_ratio < 0.7:
+        base += 0.0
+    elif voiced_ratio < 0.85:
+        base += 0.5
+    else:
+        base += 0.8
+
+    # --- adjustments: speech_rate_proxy ---
+    if speech_rate_proxy < 4:
+        base -= 1.0
+    elif speech_rate_proxy < 6:
+        base -= 0.5
+    elif speech_rate_proxy < 10:
+        base += 0.2
+    elif speech_rate_proxy < 14:
+        base += 0.4
+    else:
+        base += 0.0
+
+    # --- adjustments: SNR (noise) ---
+    if snr_db < 5:
+        base -= 0.5
+    elif snr_db > 15:
+        base += 0.2
+
+    score_0_8 = max(0.0, min(8.0, base))
+
+    # crude confidence: penalize extremes
+    confidence = 0.8
+    if duration_s < 8 or voiced_ratio < 0.2:
+        confidence -= 0.2
+    if snr_db < 3:
+        confidence -= 0.1
+    confidence = max(0.3, min(0.95, confidence))
+
+    debug_metrics = {
+        "duration_s": duration_s,
+        "voiced_ratio": voiced_ratio,
+        "speech_rate_proxy": speech_rate_proxy,
+        "snr_db": snr_db,
+        "raw_score": base,
+    }
+
+    return float(score_0_8), float(confidence), debug_metrics
+
+
+def map_score_to_level(score_0_8: float) -> str:
+    """
+    Map a 0–8 score to CEFR-like bands:
+      0–0.9  -> A1
+      1–1.9  -> A2
+      2–2.9  -> B1
+      3–3.9  -> B1+
+      4–4.9  -> B2
+      5–5.9  -> B2+
+      6–6.9  -> C1
+      7–8    -> C2
+    """
+    if score_0_8 < 1.0:
+        return "A1"
+    if score_0_8 < 2.0:
+        return "A2"
+    if score_0_8 < 3.0:
+        return "B1"
+    if score_0_8 < 4.0:
+        return "B1+"
+    if score_0_8 < 5.0:
+        return "B2"
+    if score_0_8 < 6.0:
+        return "B2+"
+    if score_0_8 < 7.0:
+        return "C1"
+    return "C2"
 
 
 # ---------------------------------------------------------------------------
 # Helper functions to build explanations & recommendations
 # ---------------------------------------------------------------------------
-
 
 def build_acoustic_explanation(
     level: str,
@@ -157,7 +244,6 @@ def build_acoustic_explanation(
     score_0_8: float,
     confidence: float,
 ) -> str:
-    """Generate a short explanation using the classic acoustic feature set."""
     dur = feats.get("duration_s", 0.0)
     vr = feats.get("voiced_ratio", 0.0)
     sr = feats.get("speech_rate_proxy", 0.0)
@@ -200,7 +286,6 @@ def build_acoustic_explanation(
 
 
 def build_acoustic_recommendations(level: str, feats: Dict[str, float]) -> str:
-    """Generate concrete recommendations based on acoustic features and level."""
     dur = feats.get("duration_s", 0.0)
     vr = feats.get("voiced_ratio", 0.0)
     sr = feats.get("speech_rate_proxy", 0.0)
@@ -208,7 +293,6 @@ def build_acoustic_recommendations(level: str, feats: Dict[str, float]) -> str:
 
     recs = []
 
-    # Duration-based advice
     if dur < 20:
         recs.append(
             "- Try to give longer answers (aim for 30–45 seconds per task) so you can develop your ideas more fully."
@@ -218,7 +302,6 @@ def build_acoustic_recommendations(level: str, feats: Dict[str, float]) -> str:
             "- Keep giving extended answers, and focus on adding more detail, examples and clear structure."
         )
 
-    # Voiced ratio / pauses
     if vr < 0.4:
         recs.append(
             "- There is a high proportion of silence and pauses. Plan 2–3 key ideas before you start speaking to reduce long gaps."
@@ -232,7 +315,6 @@ def build_acoustic_recommendations(level: str, feats: Dict[str, float]) -> str:
             "- Your speech is quite continuous. You can now focus on accuracy, precision and range of vocabulary."
         )
 
-    # Speech rate
     if sr < 5:
         recs.append(
             "- Your speech rate is relatively slow. Practice answering familiar questions with slightly faster delivery while staying clear."
@@ -246,13 +328,11 @@ def build_acoustic_recommendations(level: str, feats: Dict[str, float]) -> str:
             "- Your speech rate is within a natural range. Keep this pace while focusing on clarity and organization."
         )
 
-    # Stability / noise
     if zc > 0.07:
         recs.append(
             "- The signal seems a bit unstable or noisy. Use a quiet environment and keep the microphone at a consistent distance."
         )
 
-    # Level-based language advice (generic)
     if level in ("C1", "C2"):
         recs.extend(
             [
@@ -274,7 +354,7 @@ def build_acoustic_recommendations(level: str, feats: Dict[str, float]) -> str:
                 "- Expand your range of common phrases and collocations for work, study and daily life.",
             ]
         )
-    else:  # A1, A2
+    else:
         recs.extend(
             [
                 "- Focus on very frequent topics (family, work, daily routine) and short, clear sentences.",
@@ -288,7 +368,6 @@ def build_acoustic_recommendations(level: str, feats: Dict[str, float]) -> str:
 # ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
-
 
 @app.get("/")
 def root():
@@ -310,22 +389,18 @@ async def evaluate(
 
     Steps:
     1) Save uploaded audio to a temporary WAV file.
-    2) Acoustic scoring (BELT metrics -> CEFR level A1–C2).
+    2) Acoustic scoring (rule-based metrics -> CEFR-like A1–C2).
     3) ASR transcription (Whisper) to text.
     4) Text-based CEFR analysis with GPT (grammar, vocabulary, coherence, etc.).
     5) Combine into a final level, explanation and recommendations.
     """
-    # ------------------------------------------------------------------ #
-    # 1) Persist audio temporarily
-    # ------------------------------------------------------------------ #
+    # 1) Save uploaded audio
     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
         content = await audio.read()
         tmp.write(content)
         tmp_path = tmp.name
 
-    # ------------------------------------------------------------------ #
-    # 2) Acoustic feature pipeline (BELT logic)
-    # ------------------------------------------------------------------ #
+    # 2) Acoustic pipeline
     y, sr = librosa.load(tmp_path, sr=16000)
     feats = compute_basic_features(y, sr)
 
@@ -337,14 +412,10 @@ async def evaluate(
     acoustic_recs = build_acoustic_recommendations(acoustic_level, feats)
     seconds = float(feats.get("duration_s", 0.0))
 
-    # ------------------------------------------------------------------ #
-    # 3) ASR transcription
-    # ------------------------------------------------------------------ #
+    # 3) Transcription
     transcript: Optional[str] = transcribe_audio(tmp_path, language="en")
 
-    # ------------------------------------------------------------------ #
-    # 4) Text-based CEFR analysis (if transcription succeeded)
-    # ------------------------------------------------------------------ #
+    # 4) Text-based CEFR analysis
     text_eval: Optional[Dict[str, Any]] = None
     if transcript:
         task_instruction = TASK_PROMPTS.get(
@@ -361,9 +432,7 @@ async def evaluate(
             print(f"[evaluate] Error during text CEFR scoring: {e}")
             text_eval = None
 
-    # ------------------------------------------------------------------ #
     # 5) Combine acoustic + text results
-    # ------------------------------------------------------------------ #
     if text_eval is not None:
         text_level = text_eval.get("overall_level") or acoustic_level
         overall_level = text_level
@@ -388,9 +457,7 @@ async def evaluate(
         explanation = acoustic_explanation
         recommendations = acoustic_recs
 
-    # ------------------------------------------------------------------ #
-    # 6) Log result (CSV-based) using the combined level and explanation
-    # ------------------------------------------------------------------ #
+    # 6) Log result
     timestamp = datetime.utcnow().isoformat()
     log_result(
         timestamp_utc=timestamp,
