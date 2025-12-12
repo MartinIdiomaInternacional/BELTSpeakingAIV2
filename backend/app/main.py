@@ -468,28 +468,38 @@ async def evaluate(
         recommendations=recommendations,
     )
 
+      # Make metrics JSON-friendly (no numpy types)
     metrics_json = {k: float(v) for k, v in metrics.items()}
 
+    # Text-based evaluation pieces (may be None)
     dimensions = (text_eval or {}).get("dimensions")
     text_overall_comment = (text_eval or {}).get("overall_comment")
     text_improvement = (text_eval or {}).get("improvement_advice")
+    text_total_score = (text_eval or {}).get("total_score")
 
     return {
-        "score": overall_level,
+        # Main fields used by the frontend today
+        "score": overall_level,                   # final CEFR level for this task
         "explanation": explanation,
         "recommendations": recommendations,
         "seconds": seconds,
         "task_id": task_id,
+
+        # Acoustic model info
         "acoustic_level": acoustic_level,
         "score_0_8": float(score_0_8),
         "confidence": float(confidence),
         "metrics": metrics_json,
+
+        # Text / NLP info
         "transcript": transcript,
         "text_level": text_level,
-        "text_dimensions": dimensions,
+        "text_dimensions": dimensions,            # {dim: {level, score}}
+        "text_total_score": text_total_score,     # numeric 0–6 for this task
         "text_overall_comment": text_overall_comment,
         "text_improvement_advice": text_improvement,
     }
+
 
 
 if __name__ == "__main__":
