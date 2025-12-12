@@ -1,0 +1,168 @@
+import json
+from typing import Any, Dict
+
+from app.nlp.openai_client import get_client
+
+JSONDict = Dict[str, Any]
+
+
+def score_transcript_cefr(
+    transcript: str,
+    task_instruction: str,
+    target_language: str = "English",
+    model_name: str = "gpt-4o-mini",
+) -> JSONDict:
+    """
+    Use an LLM to evaluate the *transcript* according to CEFR speaking descriptors.
+
+    Returns a JSON-like dict, for example:
+    {
+      "overall_level": "B2",
+      "total_score": 4.3,
+      "dimensions": {
+        "fluency":        {"level": "B2",  "score": 4.4},
+        "grammar":        {"level": "B1+", "score": 3.6},
+        "vocabulary":     {"level": "B2",  "score": 4.1},
+        "pronunciation":  {"level": "B2-", "score": 3.9},
+        "coherence":      {"level": "B2",  "score": 4.3}
+      },
+      "overall_comment": "...",
+      "improvement_advice": "...",
+      "transcript": "..."
+    }
+
+    All numeric scores are expected on a 0–6 scale (A1–C2).
+    We keep the raw GPT scores as-is (no extra normalization).
+    """
+    client = get_client()
+
+    system_prompt = (
+        "You are an experienced Cambridge / CEFR speaking examiner. "
+        "You evaluate candidates on the CEFR scale (A1, A2, B1, B1+, B2, B2+, C1, C2). "
+        "You are strict but fair and provide concise, practical feedback. "
+        "You rate each dimension numerically on a 0–6 scale where:\n"
+        "0 = very weak A1, 1 = A2, 2 = B1, 3 = B1+, 4 = B2, 5 = B2+, 6 = C1/C2.\n"
+        "Always keep numeric scores in the range 0–6 (decimals allowed)."
+    )
+
+    user_prompt = f"""
+You will receive:
+1) The task instruction given to the candidate.
+2) The candidate's transcript (automatic transcription, may contain minor errors).
+
+Task instruction:
+\"\"\"{task_instruction}\"\"\"
+
+Transcript:
+\"\"\"{transcript}\"\"\"
+
+Evaluate the candidate's speaking performance in {target_language} ONLY,
+ignoring minor transcription typos if the intended meaning is still clear.
+
+Rate the following dimensions, each with:
+- a CEFR-like level label (A1, A2, B1, B1+, B2, B2+, C1, C2), and
+- a numeric score from 0 to 6 (decimals allowed), using this approximate mapping:
+  0 ≈ A1, 1 ≈ A2, 2 ≈ B1, 3 ≈ B1+, 4 ≈ B2, 5 ≈ B2+, 6 ≈ C1/C2.
+
+Dimensions:
+- fluency
+- grammatical_range
+- grammatical_accuracy
+- lexical_range
+- lexical_control
+- pronunciation
+- coherence
+
+Also provide:
+- a total_score (0–6) summarizing the overall speaking performance for this task,
+- an overall_level string (CEFR-like label) aligned with that total_score,
+- a short overall_comment (2–4 sentences),
+- a practical improvement_advice field with 3–6 bullet-style suggestions separated by line breaks,
+- and the final transcript (cleaned up if needed).
+
+Return a JSON object with the following structure (and nothing else):
+
+{{
+  "overall_level": "CEFR level string, e.g. B1+, B2, C1",
+  "total_score": 4.2,
+  "dimensions": {{
+    "fluency": {{
+      "level": "B2",
+      "score": 4.3
+    }},
+    "grammatical_range": {{
+      "level": "B1+",
+      "score": 3.5
+    }},
+    "grammatical_accuracy": {{
+      "level": "B1",
+      "score": 3.0
+    }},
+    "lexical_range": {{
+      "level": "B2",
+      "score": 4.0
+    }},
+    "lexical_control": {{
+      "level": "B1+",
+      "score": 3.5
+    }},
+    "pronunciation": {{
+      "level": "B2-",
+      "score": 3.8
+    }},
+    "coherence": {{
+      "level": "B2",
+      "score": 4.1
+    }}
+  }},
+  "overall_comment": "2–4 sentences summarizing the candidate's strengths and weaknesses.",
+  "improvement_advice": "3–6 bullet-style suggestions in plain text, separated by line breaks.",
+  "transcript": "Cleaned-up transcript if needed, otherwise copy the original."
+}}
+"""
+
+    completion = client.chat.completions.create(
+        model=model_name,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.3,
+    )
+
+    content = completion.choices[0].message.content
+    try:
+        data: JSONDict = json.loads(content)
+    except Exception:
+        data = {
+            "overall_level": "N/A",
+            "total_score": None,
+            "dimensions": {},
+            "overall_comment": "Automatic text evaluation failed to parse JSON.",
+            "improvement_advice": "",
+            "transcript": transcript,
+            "raw_response": content,
+        }
+        return data
+
+    # Sanity checks / defaults to keep the rest of the pipeline robust
+    if "total_score" not in data:
+        data["total_score"] = None
+    if "dimensions" not in data or not isinstance(data["dimensions"], dict):
+        data["dimensions"] = {}
+
+    # Ensure each dimension has both 'level' and 'score' keys
+    for dim_name, dim_val in list(data["dimensions"].items()):
+        if not isinstance(dim_val, dict):
+            data["dimensions"][dim_name] = {
+                "level": str(dim_val),
+                "score": None,
+            }
+        else:
+            if "level" not in dim_val:
+                dim_val["level"] = "N/A"
+            if "score" not in dim_val:
+                dim_val["score"] = None
+
+    return data

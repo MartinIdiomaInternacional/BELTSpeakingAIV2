@@ -1,6 +1,7 @@
-import React, { useState } from "react";
+import React, { useState, useMemo } from "react";
 import Recorder from "./components/Recorder";
 import LanguageSelect from "./components/LanguageSelect";
+import DimensionRadar from "./components/DimensionRadar";
 
 const TASKS = [
   {
@@ -23,10 +24,44 @@ const TASKS = [
   },
 ];
 
+// Dimensions returned by the backend
+const DIMENSIONS = [
+  "fluency",
+  "grammatical_range",
+  "grammatical_accuracy",
+  "lexical_range",
+  "lexical_control",
+  "pronunciation",
+  "coherence",
+];
+
+// Dimension weights (sum to 1.00)
+const DIMENSION_WEIGHTS = {
+  fluency: 0.25,
+  pronunciation: 0.2,
+  coherence: 0.15,
+  grammatical_range: 0.15,
+  grammatical_accuracy: 0.1,
+  lexical_range: 0.1,
+  lexical_control: 0.05,
+};
+
+// Numeric (0–6) → CEFR label
+function numericToLevel(score) {
+  if (score == null || isNaN(score)) return "N/A";
+  if (score < 0.5) return "A1";
+  if (score < 1.5) return "A2";
+  if (score < 2.5) return "B1";
+  if (score < 3.5) return "B1+";
+  if (score < 4.5) return "B2";
+  if (score < 5.5) return "B2+";
+  return "C1/C2";
+}
+
 export default function App() {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [language, setLanguage] = useState("en");
-  const [results, setResults] = useState({});
+  const [results, setResults] = useState({}); // { taskId: evaluationResult }
 
   const currentTask = TASKS[currentIndex];
 
@@ -42,6 +77,76 @@ export default function App() {
 
   const isLastTask = currentIndex === TASKS.length - 1;
 
+  // ------------------------------------------------------------
+  // GLOBAL HYBRID SUMMARY (Option C)
+  // global = 0.6 * weighted_dim_avg + 0.4 * avg_task_total
+  // ------------------------------------------------------------
+  const globalSummary = useMemo(() => {
+    const completedResults = Object.values(results).filter(Boolean);
+    if (completedResults.length !== TASKS.length) return null;
+
+    // Build per-dimension accumulators across all tasks
+    let perDim = {};
+    DIMENSIONS.forEach((d) => (perDim[d] = { sum: 0, count: 0 }));
+
+    // Collect task total scores (0–6) from GPT results
+    let taskTotals = [];
+
+    completedResults.forEach((r) => {
+      if (typeof r.text_total_score === "number") {
+        taskTotals.push(r.text_total_score);
+      }
+
+      const dims = r.text_dimensions || {};
+      DIMENSIONS.forEach((d) => {
+        const info = dims[d];
+        if (info && typeof info.score === "number") {
+          perDim[d].sum += info.score;
+          perDim[d].count += 1;
+        }
+      });
+    });
+
+    if (!taskTotals.length) return null;
+
+    // Average of task total scores (0–6)
+    const avgTaskTotal =
+      taskTotals.reduce((a, b) => a + b, 0) / taskTotals.length;
+
+    // Dimension averages (0–6) + weighted dimension score
+    let dimensionAverages = {};
+    let weightedSum = 0;
+    let weightTotal = 0;
+
+    DIMENSIONS.forEach((d) => {
+      if (perDim[d].count > 0) {
+        const avg = perDim[d].sum / perDim[d].count;
+        dimensionAverages[d] = avg;
+
+        const w = DIMENSION_WEIGHTS[d] || 0;
+        weightedSum += avg * w;
+        weightTotal += w;
+      }
+    });
+
+    const avgDimScore = weightTotal > 0 ? weightedSum / weightTotal : null;
+    if (avgDimScore == null) return null;
+
+    // Hybrid score (0–6)
+    const hybridScore = 0.6 * avgDimScore + 0.4 * avgTaskTotal;
+
+    return {
+      avgDimScore,
+      avgTaskTotal,
+      hybridScore,
+      globalLevel: numericToLevel(hybridScore),
+      dimensionAverages,
+    };
+  }, [results]);
+
+  // ------------------------------------------------------------
+  // RENDER
+  // ------------------------------------------------------------
   return (
     <div className="app">
       <header className="app-header">
@@ -72,6 +177,57 @@ export default function App() {
           Task {currentIndex + 1} of {TASKS.length}
         </p>
       </div>
+
+      {/* ------------------------------------------------------ */}
+      {/* GLOBAL RESULTS (shown only after all 3 tasks) */}
+      {/* ------------------------------------------------------ */}
+      {globalSummary && (
+        <section className="global-results">
+          <h2>Overall Speaking Result</h2>
+
+          <p className="global-level">
+            <strong>Global CEFR Level:</strong>{" "}
+            <span className="level-badge">{globalSummary.globalLevel}</span>
+          </p>
+
+          <p className="score-details">
+            Hybrid score (0–6):{" "}
+            <strong>{globalSummary.hybridScore.toFixed(2)}</strong>
+            <br />
+            <small>
+              (60% weighted dimension score + 40% average task total)
+            </small>
+          </p>
+
+          {/* ✅ Add the Radar here */}
+          <h3>Dimension Profile</h3>
+          <DimensionRadar
+            dimensionAverages={globalSummary.dimensionAverages}
+          />
+
+          <h3>Dimension Averages</h3>
+          <table className="dimension-table">
+            <thead>
+              <tr>
+                <th>Dimension</th>
+                <th>Average Score (0–6)</th>
+                <th>CEFR</th>
+              </tr>
+            </thead>
+            <tbody>
+              {Object.entries(globalSummary.dimensionAverages).map(
+                ([dim, score]) => (
+                  <tr key={dim}>
+                    <td>{dim.replace(/_/g, " ")}</td>
+                    <td>{score.toFixed(2)}</td>
+                    <td>{numericToLevel(score)}</td>
+                  </tr>
+                )
+              )}
+            </tbody>
+          </table>
+        </section>
+      )}
     </div>
   );
 }

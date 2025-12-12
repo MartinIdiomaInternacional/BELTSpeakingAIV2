@@ -1,119 +1,114 @@
-import librosa
 import numpy as np
-import torch
+import librosa
+from typing import Dict, Tuple
 
 
-def load_audio(path: str, target_sr: int = 16000):
-    """Load mono audio at a fixed sample rate."""
-    audio, sr = librosa.load(path, sr=target_sr)
-    if audio.ndim > 1:
-        audio = librosa.to_mono(audio)
-    return audio, sr
+# -------------------------------------------------------------
+# Minimal helpers to satisfy cefr_scorer imports
+# -------------------------------------------------------------
+
+def load_audio(path: str, sr: int = 16000) -> Tuple[np.ndarray, int]:
+    """
+    Simple wrapper to load audio from a file path using librosa.
+    This exists because cefr_scorer.py imports it.
+    """
+    y, sr = librosa.load(path, sr=sr)
+    return y.astype(np.float32), sr
 
 
-def compute_duration(audio: np.ndarray, sr: int) -> float:
-    """Duration in seconds."""
-    return float(len(audio) / sr)
+def extract_feature_vector(y: np.ndarray, sr: int) -> Dict[str, float]:
+    """
+    Legacy function required by older BELT code.
+    The new pipeline does not rely on it explicitly, but cefr_scorer imports it.
+    We simply return the same structure as compute_basic_features to keep compatibility.
+    """
+    return compute_basic_features(y, sr)
 
 
-def compute_rms(audio: np.ndarray, frame_length: int = 1024, hop_length: int = 512):
-    """Frame-wise RMS and its mean/std."""
-    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
-    return float(rms.mean()), float(rms.std())
+def extract_debug_metrics(y: np.ndarray, sr: int) -> Dict[str, float]:
+    """
+    Legacy helper for debugging metrics, required by cefr_scorer imports.
+    For now, we just mirror compute_basic_features so that the API remains simple.
+    """
+    return compute_basic_features(y, sr)
 
 
-def compute_zero_crossing_rate(audio: np.ndarray, frame_length: int = 1024, hop_length: int = 512):
-    """Zero-crossing rate (how often signal changes sign)."""
-    zcr = librosa.feature.zero_crossing_rate(
-        y=audio, frame_length=frame_length, hop_length=hop_length
+# -------------------------------------------------------------
+# Core acoustic feature computation used by the BELT feature model
+# -------------------------------------------------------------
+
+def _safe_log10(x: float) -> float:
+    return float(np.log10(max(x, 1e-8)))
+
+
+def compute_basic_features(y: np.ndarray, sr: int) -> Dict[str, float]:
+    """
+    Compute core acoustic features used by the BELT feature model.
+    Returns:
+      - duration_s
+      - voiced_ratio
+      - voiced_s
+      - avg_energy
+      - avg_zcr
+      - speech_rate_proxy
+      - snr_db
+    """
+    y = np.asarray(y, dtype=np.float32)
+
+    duration_s = float(len(y) / float(sr)) if sr > 0 else 0.0
+
+    frame_length = 1024
+    hop_length = 512
+
+    rms = librosa.feature.rms(
+        y=y, frame_length=frame_length, hop_length=hop_length
     )[0]
-    return float(zcr.mean()), float(zcr.std())
 
+    if rms.size == 0:
+        return {
+            "duration_s": 0.0,
+            "voiced_ratio": 0.0,
+            "voiced_s": 0.0,
+            "avg_energy": 0.0,
+            "avg_zcr": 0.0,
+            "speech_rate_proxy": 0.0,
+            "snr_db": 0.0,
+        }
 
-def compute_spectral_centroid(audio: np.ndarray, sr: int, hop_length: int = 512):
-    """Spectral centroid: rough 'brightness' of the sound."""
-    sc = librosa.feature.spectral_centroid(y=audio, sr=sr, hop_length=hop_length)[0]
-    return float(sc.mean()), float(sc.std())
+    max_rms = float(rms.max())
+    energy_threshold = 0.4 * max_rms if max_rms > 0 else 0.0
+    voiced_mask = rms > energy_threshold
+    voiced_ratio = float(voiced_mask.mean())
+    voiced_s = float(voiced_ratio * duration_s)
 
+    avg_energy = float(rms.mean())
 
-def compute_speech_activity(
-    audio: np.ndarray,
-    frame_length: int = 1024,
-    hop_length: int = 512,
-    energy_threshold_ratio: float = 0.4,
-):
-    """
-    Very simple voice activity estimate:
-    - compute RMS per frame
-    - frames above (threshold_ratio * max_rms) = speech
-    Returns: (speech_ratio, silence_ratio)
-    """
-    rms = librosa.feature.rms(y=audio, frame_length=frame_length, hop_length=hop_length)[0]
-    max_rms = float(rms.max()) if rms.size > 0 else 0.0
-    if max_rms <= 0:
-        return 0.0, 1.0
+    zcr = librosa.feature.zero_crossing_rate(
+        y=y, frame_length=frame_length, hop_length=hop_length
+    )[0]
+    avg_zcr = float(zcr.mean()) if zcr.size > 0 else 0.0
 
-    threshold = energy_threshold_ratio * max_rms
-    speech_frames = np.sum(rms > threshold)
-    total_frames = rms.size
-    speech_ratio = float(speech_frames / total_frames) if total_frames > 0 else 0.0
-    silence_ratio = 1.0 - speech_ratio
-    return speech_ratio, silence_ratio
+    voiced_frames = float(voiced_mask.sum())
+    if duration_s > 0:
+        speech_rate_proxy = voiced_frames / duration_s
+    else:
+        speech_rate_proxy = 0.0
 
-
-def extract_feature_vector(audio: np.ndarray, sr: int) -> torch.Tensor:
-    """
-    Build a small numeric feature vector summarizing the audio.
-    This is our 'real model input' (even if later we replace
-    the rule-based scoring with a trained model).
-    """
-    duration_sec = compute_duration(audio, sr)
-    rms_mean, rms_std = compute_rms(audio)
-    zcr_mean, zcr_std = compute_zero_crossing_rate(audio)
-    sc_mean, sc_std = compute_spectral_centroid(audio, sr)
-    speech_ratio, silence_ratio = compute_speech_activity(audio)
-
-    # Simple log-safe transforms
-    def safe_log(x):
-        return float(np.log10(x + 1e-6))
-
-    features = np.array(
-        [
-            duration_sec,
-            rms_mean,
-            rms_std,
-            zcr_mean,
-            zcr_std,
-            sc_mean,
-            sc_std,
-            speech_ratio,
-            silence_ratio,
-            safe_log(duration_sec),
-            safe_log(rms_mean),
-            safe_log(sc_mean),
-        ],
-        dtype=np.float32,
-    )
-
-    return torch.tensor(features, dtype=torch.float32)
-
-
-def extract_debug_metrics(audio: np.ndarray, sr: int) -> dict:
-    """Return a dict with human-readable metrics (for explanations/debug)."""
-    duration_sec = compute_duration(audio, sr)
-    rms_mean, rms_std = compute_rms(audio)
-    zcr_mean, zcr_std = compute_zero_crossing_rate(audio)
-    sc_mean, sc_std = compute_spectral_centroid(audio, sr)
-    speech_ratio, silence_ratio = compute_speech_activity(audio)
+    high_energy = rms[voiced_mask]
+    low_energy = rms[~voiced_mask]
+    if high_energy.size > 0 and low_energy.size > 0:
+        signal_power = float(np.mean(high_energy ** 2))
+        noise_power = float(np.mean(low_energy ** 2))
+        snr_db = 10.0 * _safe_log10(signal_power / (noise_power + 1e-8))
+    else:
+        snr_db = 0.0
 
     return {
-        "duration_sec": float(duration_sec),
-        "rms_mean": float(rms_mean),
-        "rms_std": float(rms_std),
-        "zcr_mean": float(zcr_mean),
-        "zcr_std": float(zcr_std),
-        "spectral_centroid_mean": float(sc_mean),
-        "spectral_centroid_std": float(sc_std),
-        "speech_ratio": float(speech_ratio),
-        "silence_ratio": float(silence_ratio),
+        "duration_s": duration_s,
+        "voiced_ratio": voiced_ratio,
+        "voiced_s": voiced_s,
+        "avg_energy": avg_energy,
+        "avg_zcr": avg_zcr,
+        "speech_rate_proxy": speech_rate_proxy,
+        "snr_db": snr_db,
     }
