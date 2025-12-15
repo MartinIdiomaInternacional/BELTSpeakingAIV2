@@ -158,12 +158,14 @@ export default function App() {
 
       <LanguageSelect value={language} onChange={setLanguage} />
 
-      <Recorder
-        key={currentTask.id}
-        taskId={currentTask.id}
-        task={currentTask}
-        onFinished={handleFinished}
-      />
+     <Recorder
+  key={currentTask.id}
+  taskId={currentTask.id}
+  task={currentTask}
+  onFinished={handleFinished}
+  showFeedback={isLastTask}   // ✅ only show feedback on Task 3
+/>
+
 
       <div className="task-navigation">
         <button
