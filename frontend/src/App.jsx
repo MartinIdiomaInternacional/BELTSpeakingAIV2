@@ -1,8 +1,9 @@
-import React, { useState, useMemo } from "react";
+import React, { useMemo, useState } from "react";
 import Recorder from "./components/Recorder";
 import LanguageSelect from "./components/LanguageSelect";
 import DimensionRadar from "./components/DimensionRadar";
 
+// ---------- Question pools (randomized per attempt) ----------
 const TASKS = [
   {
     id: 1,
@@ -39,8 +40,11 @@ const TASKS = [
   },
 ];
 
+function pickRandom(arr) {
+  return arr[Math.floor(Math.random() * arr.length)];
+}
 
-// Dimensions returned by the backend
+// ---------- Dimensions + weights ----------
 const DIMENSIONS = [
   "fluency",
   "grammatical_range",
@@ -51,7 +55,6 @@ const DIMENSIONS = [
   "coherence",
 ];
 
-// Dimension weights (sum to 1.00)
 const DIMENSION_WEIGHTS = {
   fluency: 0.25,
   pronunciation: 0.2,
@@ -62,7 +65,7 @@ const DIMENSION_WEIGHTS = {
   lexical_control: 0.05,
 };
 
-// Numeric (0–6) → CEFR label
+// Numeric (0–6) → CEFR label (simple mapping)
 function numericToLevel(score) {
   if (score == null || isNaN(score)) return "N/A";
   if (score < 0.5) return "A1";
@@ -77,60 +80,72 @@ function numericToLevel(score) {
 export default function App() {
   const [currentIndex, setCurrentIndex] = useState(0);
   const [language, setLanguage] = useState("en");
-  const [results, setResults] = useState({}); // { taskId: evaluationResult }
 
-  const currentTask = TASKS[currentIndex];
+  // Results per task: { [taskId]: dataFromAPI }
+  const [results, setResults] = useState({});
+
+  // ✅ Randomize prompts ONCE per page load (stable for the attempt)
+  const [taskSet] = useState(() =>
+    TASKS.map((t) => ({
+      ...t,
+      text: pickRandom(t.prompts),
+    }))
+  );
+
+  const currentTask = taskSet[currentIndex];
+  const isLastTask = currentIndex === taskSet.length - 1;
 
   const handleFinished = (taskId, data) => {
     setResults((prev) => ({ ...prev, [taskId]: data }));
   };
 
   const nextTask = () => {
-    if (currentIndex < TASKS.length - 1) {
+    if (currentIndex < taskSet.length - 1) {
       setCurrentIndex((i) => i + 1);
     }
   };
 
-  const isLastTask = currentIndex === TASKS.length - 1;
-
   // ------------------------------------------------------------
   // GLOBAL HYBRID SUMMARY (Option C)
-  // global = 0.6 * weighted_dim_avg + 0.4 * avg_task_total
+  // hybrid = 0.6 * weighted_dim_avg + 0.4 * avg_task_total
   // ------------------------------------------------------------
   const globalSummary = useMemo(() => {
-    const completedResults = Object.values(results).filter(Boolean);
-    if (completedResults.length !== TASKS.length) return null;
+    const completed = taskSet.every((t) => results[t.id]);
+    if (!completed) return null;
 
-    // Build per-dimension accumulators across all tasks
-    let perDim = {};
-    DIMENSIONS.forEach((d) => (perDim[d] = { sum: 0, count: 0 }));
+    const completedResults = taskSet.map((t) => results[t.id]).filter(Boolean);
 
-    // Collect task total scores (0–6) from GPT results
-    let taskTotals = [];
-
+    // task total scores (0–6)
+    const taskTotals = [];
     completedResults.forEach((r) => {
       if (typeof r.text_total_score === "number") {
         taskTotals.push(r.text_total_score);
+      } else if (typeof r.score === "number") {
+        // fallback older payload
+        taskTotals.push(r.score);
       }
+    });
+    if (!taskTotals.length) return null;
 
+    const avgTaskTotal =
+      taskTotals.reduce((a, b) => a + b, 0) / taskTotals.length;
+
+    // dimension averages (0–6)
+    const perDim = {};
+    DIMENSIONS.forEach((d) => (perDim[d] = { sum: 0, count: 0 }));
+
+    completedResults.forEach((r) => {
       const dims = r.text_dimensions || {};
       DIMENSIONS.forEach((d) => {
-        const info = dims[d];
-        if (info && typeof info.score === "number") {
-          perDim[d].sum += info.score;
+        const v = dims?.[d]?.score;
+        if (typeof v === "number") {
+          perDim[d].sum += v;
           perDim[d].count += 1;
         }
       });
     });
 
-    if (!taskTotals.length) return null;
-
-    // Average of task total scores (0–6)
-    const avgTaskTotal =
-      taskTotals.reduce((a, b) => a + b, 0) / taskTotals.length;
-
-    // Dimension averages (0–6) + weighted dimension score
-    let dimensionAverages = {};
+    const dimensionAverages = {};
     let weightedSum = 0;
     let weightTotal = 0;
 
@@ -148,21 +163,17 @@ export default function App() {
     const avgDimScore = weightTotal > 0 ? weightedSum / weightTotal : null;
     if (avgDimScore == null) return null;
 
-    // Hybrid score (0–6)
     const hybridScore = 0.6 * avgDimScore + 0.4 * avgTaskTotal;
 
     return {
-      avgDimScore,
       avgTaskTotal,
+      avgDimScore,
       hybridScore,
       globalLevel: numericToLevel(hybridScore),
       dimensionAverages,
     };
-  }, [results]);
+  }, [results, taskSet]);
 
-  // ------------------------------------------------------------
-  // RENDER
-  // ------------------------------------------------------------
   return (
     <div className="app">
       <header className="app-header">
@@ -174,14 +185,13 @@ export default function App() {
 
       <LanguageSelect value={language} onChange={setLanguage} />
 
-     <Recorder
-  key={currentTask.id}
-  taskId={currentTask.id}
-  task={currentTask}
-  onFinished={handleFinished}
-  showFeedback={isLastTask}   // ✅ only show feedback on Task 3
-/>
-
+      <Recorder
+        key={currentTask.id}
+        taskId={currentTask.id}
+        task={currentTask}
+        onFinished={handleFinished}
+        showFeedback={isLastTask}  // ✅ only show feedback on Task 3
+      />
 
       <div className="task-navigation">
         <button
@@ -192,13 +202,11 @@ export default function App() {
           {isLastTask ? "No more tasks" : "Next task"}
         </button>
         <p>
-          Task {currentIndex + 1} of {TASKS.length}
+          Task {currentIndex + 1} of {taskSet.length}
         </p>
       </div>
 
-      {/* ------------------------------------------------------ */}
-      {/* GLOBAL RESULTS (shown only after all 3 tasks) */}
-      {/* ------------------------------------------------------ */}
+      {/* ✅ Global results only after all tasks have results */}
       {globalSummary && (
         <section className="global-results">
           <h2>Overall Speaking Result</h2>
@@ -212,12 +220,9 @@ export default function App() {
             Hybrid score (0–6):{" "}
             <strong>{globalSummary.hybridScore.toFixed(2)}</strong>
             <br />
-            <small>
-              (60% weighted dimension score + 40% average task total)
-            </small>
+            <small>(60% weighted dimension score + 40% average task total)</small>
           </p>
 
-          {/* ✅ Add the Radar here */}
           <h3>Dimension Profile</h3>
           <DimensionRadar
             dimensionAverages={globalSummary.dimensionAverages}
