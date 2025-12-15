@@ -1,120 +1,162 @@
 import React, { useEffect, useRef, useState } from "react";
-import Countdown from "./Countdown";
-import WaveformCanvas from "./WaveformCanvas";
 import { evaluateSpeaking } from "../lib/api";
 
-export default function Recorder({ taskId, task, onFinished }) {
-  const [isRecording, setIsRecording] = useState(false);
-  const [secondsLeft, setSecondsLeft] = useState(task.maxSeconds);
+function pickSupportedMimeType() {
+  const preferred = [
+    "audio/webm;codecs=opus",
+    "audio/webm",
+    "audio/ogg;codecs=opus",
+    "audio/ogg",
+  ];
+  for (const t of preferred) {
+    if (window.MediaRecorder && MediaRecorder.isTypeSupported(t)) return t;
+  }
+  return "";
+}
+
+export default function Recorder({
+  taskId,
+  task,
+  onFinished,
+  showFeedback = true,
+}) {
+  const [recording, setRecording] = useState(false);
   const [status, setStatus] = useState("");
+  const [err, setErr] = useState("");
   const [result, setResult] = useState(null);
-  const [loading, setLoading] = useState(false);
+  const [timeLeft, setTimeLeft] = useState(task.maxSeconds);
 
   const mediaRecorderRef = useRef(null);
   const chunksRef = useRef([]);
+  const streamRef = useRef(null);
   const timerRef = useRef(null);
 
-  // Timer logic
   useEffect(() => {
-    if (!isRecording) {
-      clearInterval(timerRef.current);
-      return;
-    }
+    // reset per task
+    setRecording(false);
+    setStatus("");
+    setErr("");
+    setResult(null);
+    setTimeLeft(task.maxSeconds);
 
-    setSecondsLeft(task.maxSeconds);
-    timerRef.current = setInterval(() => {
-      setSecondsLeft((prev) => {
-        if (prev <= 1) {
-          clearInterval(timerRef.current);
-          stopRecording();
-          return 0;
-        }
-        return prev - 1;
-      });
-    }, 1000);
+    // cleanup any old timers
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
 
-    return () => clearInterval(timerRef.current);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isRecording, task.maxSeconds]);
-
-  const startRecording = async () => {
+    // stop any existing recorder
     try {
-      setResult(null);
-      setStatus("Requesting microphone…");
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-      const mediaRecorder = new MediaRecorder(stream);
-      mediaRecorderRef.current = mediaRecorder;
-      chunksRef.current = [];
-
-      mediaRecorder.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) {
-          chunksRef.current.push(e.data);
-        }
-      };
-
-      mediaRecorder.onerror = (e) => {
-        console.error("MediaRecorder error", e);
-        setStatus("Recording error. Please try again.");
-      };
-
-      mediaRecorder.onstop = async () => {
-        setStatus("Processing audio…");
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-        chunksRef.current = [];
-
-        // stop tracks
-        stream.getTracks().forEach((t) => t.stop());
-
-        await sendToApi(blob);
-      };
-
-      mediaRecorder.start();
-      setIsRecording(true);
-      setStatus("Recording…");
-    } catch (err) {
-      console.error(err);
-      setStatus(
-        "Microphone permission denied or unavailable. Please allow mic access and try again."
-      );
-    }
-  };
-
-  const stopRecording = () => {
-    const mr = mediaRecorderRef.current;
-    if (!mr || mr.state !== "recording") return;
-    try {
-      mr.requestData();
-    } catch (e) {
-      console.error(e);
-    }
-    try {
-      mr.stop();
-    } catch (e) {
-      console.error(e);
-    }
-    setIsRecording(false);
-  };
-
-  const sendToApi = async (audioBlob) => {
-    setLoading(true);
-    try {
-      const data = await evaluateSpeaking({
-        audioBlob,
-        taskId,
-      });
-      setResult(data);
-      setStatus("Result received.");
-      if (onFinished) {
-        onFinished(taskId, data);
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
       }
-    } catch (err) {
-      console.error(err);
-      setStatus(`Error: ${err.message}`);
-    } finally {
-      setLoading(false);
+    } catch {}
+
+    // stop any existing stream tracks
+    try {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
+      }
+    } catch {}
+
+    streamRef.current = null;
+    mediaRecorderRef.current = null;
+    chunksRef.current = [];
+  }, [taskId, task.maxSeconds]);
+
+  async function ensureMic() {
+    if (streamRef.current) return streamRef.current;
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    streamRef.current = stream;
+    return stream;
+  }
+
+  async function start() {
+    setErr("");
+    setResult(null);
+    setStatus("");
+
+    try {
+      const stream = await ensureMic();
+      const mimeType = pickSupportedMimeType();
+      const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
+
+      chunksRef.current = [];
+      mr.ondataavailable = (e) => {
+        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
+      };
+
+      mr.onstop = async () => {
+        try {
+          setStatus("Evaluating...");
+          const blob = new Blob(chunksRef.current, {
+            type: mr.mimeType || "audio/webm",
+          });
+
+          const data = await evaluateSpeaking({ audioBlob: blob, taskId });
+
+          setResult(data);
+          onFinished?.(taskId, data);
+          setStatus("Done");
+        } catch (e) {
+          console.error(e);
+          setErr(e?.message || "Evaluation failed");
+          setStatus("");
+        }
+      };
+
+      mediaRecorderRef.current = mr;
+      mr.start();
+
+      setRecording(true);
+      setStatus("Recording...");
+
+      // countdown timer + auto-stop at maxSeconds
+      const startMs = Date.now();
+      setTimeLeft(task.maxSeconds);
+
+      timerRef.current = setInterval(() => {
+        const elapsed = (Date.now() - startMs) / 1000;
+        const left = Math.max(0, Math.ceil(task.maxSeconds - elapsed));
+        setTimeLeft(left);
+
+        if (left <= 0) {
+          stop();
+        }
+      }, 250);
+    } catch (e) {
+      console.error(e);
+      setErr("Microphone permission denied or not available.");
     }
-  };
+  }
+
+  function stop() {
+    try {
+      if (timerRef.current) clearInterval(timerRef.current);
+      timerRef.current = null;
+    } catch {}
+
+    try {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
+    } catch {}
+
+    setRecording(false);
+  }
+
+  // Helpers to display either old or new backend payloads
+  const uiLevel = result?.text_level || result?.level || result?.score || null;
+  const uiTotal =
+    typeof result?.text_total_score === "number"
+      ? result.text_total_score
+      : typeof result?.score === "number"
+      ? result.score
+      : null;
+
+  const uiRecs =
+    result?.text_recommendations ||
+    result?.recommendations ||
+    result?.explanation ||
+    "";
 
   return (
     <div className="recorder">
@@ -123,57 +165,45 @@ export default function Recorder({ taskId, task, onFinished }) {
         <p className="task-text">{task.text}</p>
       </div>
 
-      <WaveformCanvas isRecording={isRecording} />
-
       <div className="recorder-controls">
-        <button
-          onClick={startRecording}
-          disabled={isRecording || loading}
-          className="btn primary"
-        >
-          {isRecording ? "Recording…" : "Start recording"}
+        <button className="btn primary" onClick={start} disabled={recording}>
+          Start
         </button>
-
-        <button
-          onClick={stopRecording}
-          disabled={!isRecording}
-          className="btn secondary"
-        >
+        <button className="btn secondary" onClick={stop} disabled={!recording}>
           Stop
         </button>
 
-        <Countdown seconds={secondsLeft} isRunning={isRecording} />
+        <div className="countdown">
+          <div className="countdown-time">{timeLeft}s</div>
+        </div>
       </div>
 
-      <div className="recorder-status">
-        {status && <p>{status}</p>}
-        {loading && <p>Sending audio to evaluation service…</p>}
-      </div>
+      {status && <div className="recorder-status">{status}</div>}
+      {err && <div className="recorder-status" style={{ color: "#b91c1c" }}>{err}</div>}
 
-      {result && (
+      {/* ✅ Only show feedback when showFeedback is true (Task 3) */}
+      {showFeedback && result && (
         <div className="recorder-result">
           <h3>Result</h3>
-          <p>
-            <strong>Level:</strong> {result.score}
-          </p>
-          <p>
-            <strong>Explanation:</strong> {result.explanation}
-          </p>
-          <p>
-            <strong>Recommendations:</strong>
-          </p>
-          <p className="recommendations">
-            {result.recommendations.split("\n").map((line, idx) => (
-              <span key={idx}>
-                {line}
-                <br />
-              </span>
-            ))}
-          </p>
-          <p>
-            <strong>Duration (approx.):</strong>{" "}
-            {result.seconds ? result.seconds.toFixed(1) : "—"} seconds
-          </p>
+
+          {uiLevel != null && (
+            <p>
+              <strong>Level:</strong> {String(uiLevel)}
+            </p>
+          )}
+
+          {uiTotal != null && (
+            <p>
+              <strong>Total score:</strong> {uiTotal.toFixed(2)} / 6
+            </p>
+          )}
+
+          {uiRecs ? (
+            <>
+              <h4>Feedback</h4>
+              <div className="recommendations">{String(uiRecs)}</div>
+            </>
+          ) : null}
         </div>
       )}
     </div>
