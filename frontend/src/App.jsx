@@ -95,13 +95,30 @@ export default function App() {
   const currentTask = taskSet[currentIndex];
   const isLastTask = currentIndex === taskSet.length - 1;
 
-  const handleFinished = (taskId, data) => {
-    setResults((prev) => ({ ...prev, [taskId]: data }));
-  };
+  // ✅ Auto-advance config
+  const AUTO_ADVANCE = true;
+  const AUTO_ADVANCE_DELAY_MS = 650;
 
   const nextTask = () => {
     if (currentIndex < taskSet.length - 1) {
       setCurrentIndex((i) => i + 1);
+    }
+  };
+
+  const handleFinished = (taskId, data) => {
+    setResults((prev) => ({ ...prev, [taskId]: data }));
+
+    // ✅ Auto-advance once the task is evaluated (unless it's the last task)
+    if (AUTO_ADVANCE) {
+      const finishedIndex = taskSet.findIndex((t) => t.id === taskId);
+      const hasNext = finishedIndex >= 0 && finishedIndex < taskSet.length - 1;
+
+      // Only advance if the finished task is the one currently on screen
+      if (hasNext && finishedIndex === currentIndex) {
+        window.setTimeout(() => {
+          setCurrentIndex((i) => Math.min(i + 1, taskSet.length - 1));
+        }, AUTO_ADVANCE_DELAY_MS);
+      }
     }
   };
 
@@ -190,7 +207,7 @@ export default function App() {
         taskId={currentTask.id}
         task={currentTask}
         onFinished={handleFinished}
-        showFeedback={isLastTask}  // ✅ only show feedback on Task 3
+        showFeedback={isLastTask} // ✅ only show feedback on Task 3
       />
 
       <div className="task-navigation">
@@ -224,9 +241,7 @@ export default function App() {
           </p>
 
           <h3>Dimension Profile</h3>
-          <DimensionRadar
-            dimensionAverages={globalSummary.dimensionAverages}
-          />
+          <DimensionRadar dimensionAverages={globalSummary.dimensionAverages} />
 
           <h3>Dimension Averages</h3>
           <table className="dimension-table">
