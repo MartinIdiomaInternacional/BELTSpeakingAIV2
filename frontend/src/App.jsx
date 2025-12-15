@@ -211,17 +211,17 @@ export default function App() {
       />
 
       <div className="task-navigation">
-        <button
-          onClick={nextTask}
-          disabled={isLastTask}
-          className="btn tertiary"
-        >
-          {isLastTask ? "No more tasks" : "Next task"}
-        </button>
-        <p>
-          Task {currentIndex + 1} of {taskSet.length}
-        </p>
-      </div>
+  <p>
+    Task {currentIndex + 1} of {taskSet.length}
+  </p>
+
+  {!isLastTask && (
+    <small style={{ opacity: 0.75 }}>
+      Next question will load automatically after evaluation.
+    </small>
+  )}
+</div>
+
 
       {/* ✅ Global results only after all tasks have results */}
       {globalSummary && (
