@@ -14,12 +14,7 @@ function pickSupportedMimeType() {
   return "";
 }
 
-export default function Recorder({
-  taskId,
-  task,
-  onFinished,
-  showFeedback = true,
-}) {
+export default function Recorder({ taskId, task, onFinished, showFeedback = true }) {
   const [recording, setRecording] = useState(false);
   const [status, setStatus] = useState("");
   const [err, setErr] = useState("");
@@ -32,29 +27,23 @@ export default function Recorder({
   const timerRef = useRef(null);
 
   useEffect(() => {
-    // reset per task
     setRecording(false);
     setStatus("");
     setErr("");
     setResult(null);
     setTimeLeft(task.maxSeconds);
 
-    // cleanup any old timers
     if (timerRef.current) clearInterval(timerRef.current);
     timerRef.current = null;
 
-    // stop any existing recorder
     try {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      if (mediaRecorderRef.current?.state !== "inactive") {
         mediaRecorderRef.current.stop();
       }
     } catch {}
 
-    // stop any existing stream tracks
     try {
-      if (streamRef.current) {
-        streamRef.current.getTracks().forEach((t) => t.stop());
-      }
+      streamRef.current?.getTracks().forEach((t) => t.stop());
     } catch {}
 
     streamRef.current = null;
@@ -80,9 +69,7 @@ export default function Recorder({
       const mr = new MediaRecorder(stream, mimeType ? { mimeType } : undefined);
 
       chunksRef.current = [];
-      mr.ondataavailable = (e) => {
-        if (e.data && e.data.size > 0) chunksRef.current.push(e.data);
-      };
+      mr.ondataavailable = (e) => e.data.size && chunksRef.current.push(e.data);
 
       mr.onstop = async () => {
         try {
@@ -91,119 +78,97 @@ export default function Recorder({
             type: mr.mimeType || "audio/webm",
           });
 
-          const data = await evaluateSpeaking({ audioBlob: blob, taskId });
+          const data = await evaluateSpeaking({
+            audioBlob: blob,
+            taskId,
+            taskTitle: task.title,
+            promptText: task.text,
+          });
 
           setResult(data);
           onFinished?.(taskId, data);
           setStatus("Done");
         } catch (e) {
-          console.error(e);
-          setErr(e?.message || "Evaluation failed");
+          setErr("Evaluation failed.");
           setStatus("");
         }
       };
 
       mediaRecorderRef.current = mr;
       mr.start();
-
       setRecording(true);
       setStatus("Recording...");
 
-      // countdown timer + auto-stop at maxSeconds
       const startMs = Date.now();
-      setTimeLeft(task.maxSeconds);
-
       timerRef.current = setInterval(() => {
         const elapsed = (Date.now() - startMs) / 1000;
         const left = Math.max(0, Math.ceil(task.maxSeconds - elapsed));
         setTimeLeft(left);
-
-        if (left <= 0) {
-          stop();
-        }
+        if (left <= 0) stop();
       }, 250);
-    } catch (e) {
-      console.error(e);
-      setErr("Microphone permission denied or not available.");
+    } catch {
+      setErr("Microphone permission denied.");
     }
   }
 
   function stop() {
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
     try {
-      if (timerRef.current) clearInterval(timerRef.current);
-      timerRef.current = null;
+      mediaRecorderRef.current?.stop();
     } catch {}
-
-    try {
-      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-        mediaRecorderRef.current.stop();
-      }
-    } catch {}
-
     setRecording(false);
   }
 
-  // Helpers to display either old or new backend payloads
-  const uiLevel = result?.text_level || result?.level || result?.score || null;
-  const uiTotal =
-    typeof result?.text_total_score === "number"
-      ? result.text_total_score
-      : typeof result?.score === "number"
-      ? result.score
-      : null;
-
-  const uiRecs =
-    result?.text_recommendations ||
-    result?.recommendations ||
-    result?.explanation ||
-    "";
+  const feedback = result?.feedback;
 
   return (
     <div className="recorder">
-      <div className="recorder-header">
-        <h2>{task.title}</h2>
-        <p className="task-text">{task.text}</p>
-      </div>
+      <h2>{task.title}</h2>
+      <p className="task-text">{task.text}</p>
 
       <div className="recorder-controls">
-        <button className="btn primary" onClick={start} disabled={recording}>
-          Start
-        </button>
-        <button className="btn secondary" onClick={stop} disabled={!recording}>
-          Stop
-        </button>
-
-        <div className="countdown">
-          <div className="countdown-time">{timeLeft}s</div>
-        </div>
+        <button className="btn primary" onClick={start} disabled={recording}>Start</button>
+        <button className="btn secondary" onClick={stop} disabled={!recording}>Stop</button>
+        <div className="countdown">{timeLeft}s</div>
       </div>
 
       {status && <div className="recorder-status">{status}</div>}
-      {err && <div className="recorder-status" style={{ color: "#b91c1c" }}>{err}</div>}
+      {err && <div className="recorder-status error">{err}</div>}
 
-      {/* ✅ Only show feedback when showFeedback is true (Task 3) */}
-      {showFeedback && result && (
+      {showFeedback && feedback && (
         <div className="recorder-result">
-          <h3>Result</h3>
+          <h3>Feedback</h3>
 
-          {uiLevel != null && (
-            <p>
-              <strong>Level:</strong> {String(uiLevel)}
-            </p>
-          )}
+          <p>{feedback.summary}</p>
 
-          {uiTotal != null && (
-            <p>
-              <strong>Total score:</strong> {uiTotal.toFixed(2)} / 6
-            </p>
-          )}
-
-          {uiRecs ? (
+          {feedback.strengths?.length > 0 && (
             <>
-              <h4>Feedback</h4>
-              <div className="recommendations">{String(uiRecs)}</div>
+              <h4>Strengths</h4>
+              <ul>{feedback.strengths.map((s) => <li key={s}>{s}</li>)}</ul>
             </>
-          ) : null}
+          )}
+
+          {feedback.priorities?.length > 0 && (
+            <>
+              <h4>Areas to improve</h4>
+              <ul>{feedback.priorities.map((p) => <li key={p}>{p}</li>)}</ul>
+            </>
+          )}
+
+          <h4>Detailed observations</h4>
+          <ul>
+            {Object.entries(feedback.dimension_feedback || {}).map(([k, v]) => (
+              <li key={k}><strong>{k.replace(/_/g, " ")}:</strong> {v}</li>
+            ))}
+          </ul>
+
+          {feedback.task_tip && (
+            <>
+              <h4>Task tip</h4>
+              <p>{feedback.task_tip}</p>
+            </>
+          )}
         </div>
       )}
     </div>
