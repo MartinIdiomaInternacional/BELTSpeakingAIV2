@@ -10,8 +10,8 @@ const TASKS = [
     title: "Task 1 – Personal Introduction",
     maxSeconds: 45,
     prompts: [
-      "Tell me about your background, where you live, what you do, and one interesting fact about yourself.",
       "Introduce yourself: where you’re from, what you do, and what you enjoy doing in your free time.",
+      "Tell me about your background, where you live, what you do, and one interesting fact about yourself.",
       "Tell me about your daily routine and one thing you’re currently working on or learning.",
       "Describe your hometown or neighborhood and what you like (or don’t like) about it.",
     ],
