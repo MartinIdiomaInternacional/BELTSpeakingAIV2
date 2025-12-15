@@ -7,22 +7,38 @@ const TASKS = [
   {
     id: 1,
     title: "Task 1 – Personal Introduction",
-    text: "Tell me about your background, where you live, what you do, and one interesting fact about yourself.",
     maxSeconds: 45,
+    prompts: [
+      "Tell me about your background, where you live, what you do, and one interesting fact about yourself.",
+      "Introduce yourself: where you’re from, what you do, and what you enjoy doing in your free time.",
+      "Tell me about your daily routine and one thing you’re currently working on or learning.",
+      "Describe your hometown or neighborhood and what you like (or don’t like) about it.",
+    ],
   },
   {
     id: 2,
     title: "Task 2 – Describe a Situation",
-    text: "Describe a challenging situation you faced recently and how you handled it.",
     maxSeconds: 60,
+    prompts: [
+      "Describe a challenging situation you faced recently and how you handled it.",
+      "Talk about a time something didn’t go as planned. What happened and what did you do?",
+      "Describe a problem you had at work or school and how it was resolved.",
+      "Tell me about a difficult decision you had to make. What did you choose and why?",
+    ],
   },
   {
     id: 3,
     title: "Task 3 – Opinion Question",
-    text: "Do you think technology has improved communication? Why or why not?",
     maxSeconds: 60,
+    prompts: [
+      "Do you think technology has improved communication? Why or why not?",
+      "Should people work from home more often? Why or why not?",
+      "Do social media platforms do more harm than good? Explain your opinion.",
+      "Is it better to specialize in one skill or be a generalist? Why?",
+    ],
   },
 ];
+
 
 // Dimensions returned by the backend
 const DIMENSIONS = [
